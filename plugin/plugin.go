@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"go/ast"
+	"os"
 
 	pgguard "github.com/iyiola-dev/pg-guard"
 	"github.com/iyiola-dev/pg-guard/internal/analyzer"
@@ -16,8 +17,10 @@ var Analyzer = &analysis.Analyzer{
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
+	dsn := os.Getenv("PG_GUARD_DSN")
 	cfg := pgguard.Config{
 		Patterns: []string{pass.Pkg.Path()},
+		DSN:      dsn,
 	}
 
 	findings, err := analyzer.Run(context.Background(), cfg)

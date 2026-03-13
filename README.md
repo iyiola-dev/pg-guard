@@ -57,8 +57,14 @@ linters-settings:
       path: pg-guard.so
       description: Postgres query linter and risk analyzer
       settings:
-        dsn: "postgres://user:pass@localhost:5432/mydb" # optional
+        dsn_env: "PG_GUARD_DSN" # reads DSN from this env var (optional)
 ```
+
+> **⚠️ Never hardcode database credentials in config files.** Use an environment variable:
+>
+> ```sh
+> export PG_GUARD_DSN="postgres://user:pass@localhost:5432/mydb"
+> ```
 
 ## Report Output
 
