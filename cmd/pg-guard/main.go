@@ -12,6 +12,23 @@ import (
 )
 
 func main() {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, `pg-guard - Postgres query linter & risk analyzer for Go code
+
+Usage:
+  pg-guard [flags] [packages]
+
+Flags:
+`)
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, `
+Examples:
+  pg-guard ./...
+  pg-guard --dsn "$PG_GUARD_DSN" ./...
+  pg-guard --format json ./internal/repo/...
+`)
+	}
+
 	dsn := flag.String("dsn", "", "Postgres connection string for live analysis")
 	format := flag.String("format", "text", "Output format: text or json")
 	flag.Parse()
