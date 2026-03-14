@@ -68,24 +68,6 @@ linters-settings:
 > export PG_GUARD_DSN="postgres://user:pass@localhost:5432/mydb"
 > ```
 
-## Report Output
-
-pg-guard produces a report containing:
-
-- **Risk level** (`error` / `warning` / `info`) per finding
-- **File, line, and column** of the offending call
-- **Extracted SQL** (when determinable)
-- **Suggested fix** (parameterized rewrite, context addition, index creation, etc.)
-
-Example:
-
-```
-main.go:42:3  error   unparameterized-query  SQL built with fmt.Sprintf; use parameterized query instead
-main.go:55:5  warning missing-context        db.Query() called without context; use db.QueryContext()
-main.go:71:7  warning n-plus-one             query executed inside loop body (N+1 pattern)
-main.go:71:7  info    missing-index          full scan on "orders" (~2.4M rows); consider: CREATE INDEX idx_orders_user_id ON orders (user_id)
-```
-
 ## Project Structure
 
 ```
@@ -102,9 +84,14 @@ plugin/              golangci-lint plugin adapter
 
 ## Requirements
 
-- Go 1.22+
+- Go 1.24+
+- Docker (for running integration tests)
 - Postgres 13+ (for live analysis features)
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to fork, branch, and open a pull request.
 
 ## License
 
-MIT
+[MIT](LICENSE)
