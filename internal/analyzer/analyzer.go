@@ -26,6 +26,7 @@ func Run(ctx context.Context, cfg pgguard.Config) ([]pgguard.Finding, error) {
 	findings = append(findings, checks.CheckUnparameterized(queries)...)
 	findings = append(findings, checks.CheckMissingContext(queries)...)
 	findings = append(findings, checks.CheckNPlusOne(queries)...)
+	findings = append(findings, checks.CheckInvalidSQL(queries)...)
 
 	if cfg.DSN != "" {
 		dbFindings, err := runDBChecks(ctx, cfg.DSN, queries)
@@ -84,6 +85,21 @@ func runDBChecks(ctx context.Context, dsn string, queries []pgguard.ExtractedQue
 				continue
 			}
 			seen[table] = true
+
+			exists, err := db.TableExists(ctx, table)
+			if err != nil {
+				continue
+			}
+			if !exists {
+				findings = append(findings, pgguard.Finding{
+					Pos:      q.Pos,
+					Severity: pgguard.SeverityError,
+					Check:    pgguard.CheckInvalidSchema,
+					Message:  fmt.Sprintf("table %q does not exist", table),
+					SQL:      q.SQL,
+				})
+				continue
+			}
 
 			estimate, err := db.TableRowEstimate(ctx, table)
 			if err != nil {

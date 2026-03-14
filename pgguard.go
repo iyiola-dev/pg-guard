@@ -18,6 +18,8 @@ const (
 	CheckNPlusOne             CheckName = "n-plus-one"
 	CheckMissingIndex         CheckName = "missing-index"
 	CheckFullTableScan        CheckName = "full-table-scan"
+	CheckInvalidSQL           CheckName = "invalid-sql"
+	CheckInvalidSchema        CheckName = "invalid-schema"
 )
 
 type ExtractedQuery struct {
@@ -26,7 +28,7 @@ type ExtractedQuery struct {
 	FuncName      string // e.g. "db.Query", "db.ExecContext"
 	SQL           string
 	Parameterized bool
-	HasContext     bool
+	HasContext    bool
 	InLoop        bool
 	BuildMethod   string // "literal", "sprintf", "concat", "unknown"
 	Tables        []string

@@ -12,12 +12,14 @@ A static analysis tool (CLI + `golangci-lint` plugin) that finds risky SQL patte
 - **Unparameterized query detection** – Flags string-concatenated or `fmt.Sprintf`-based queries vulnerable to SQL injection.
 - **Missing context timeouts** – Detects `db.Query()` / `db.Exec()` calls that should use `Context` variants.
 - **N+1 loop detection** – Identifies queries executed inside loops.
+- **SQL syntax validation** – Parses extracted SQL using the Postgres parser and flags syntax errors.
 
 ### Live Database Analysis
 
 Connects to a running Postgres instance to enrich static findings with real schema data:
 
 - **Full-table scan detection** – Uses `pg_stat_user_tables` row estimates to flag queries on large tables with no supporting index.
+- **Schema validation** – Verifies that referenced tables exist in the database.
 - **Missing index suggestions** – Runs `EXPLAIN` on extracted queries and recommends indexes.
 - **Query rewrite suggestions** – Proposes optimized alternatives where possible.
 

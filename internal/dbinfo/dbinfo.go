@@ -76,6 +76,29 @@ func (db *DB) TableIndexes(ctx context.Context, table string) ([]IndexInfo, erro
 	return indexes, rows.Err()
 }
 
+func (db *DB) TableExists(ctx context.Context, table string) (bool, error) {
+	var exists bool
+	err := db.conn.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = $1)", table,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("dbinfo: table exists %q: %w", table, err)
+	}
+	return exists, nil
+}
+
+func (db *DB) ColumnExists(ctx context.Context, table, column string) (bool, error) {
+	var exists bool
+	err := db.conn.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = $2)",
+		table, column,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("dbinfo: column exists %q.%q: %w", table, column, err)
+	}
+	return exists, nil
+}
+
 func (db *DB) Explain(ctx context.Context, query string) (*ExplainResult, error) {
 	var planJSON string
 	err := db.conn.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+query).Scan(&planJSON)
@@ -85,9 +108,9 @@ func (db *DB) Explain(ctx context.Context, query string) (*ExplainResult, error)
 
 	var plans []struct {
 		Plan struct {
-			NodeType      string  `json:"Node Type"`
-			RelationName  string  `json:"Relation Name"`
-			PlanRows      float64 `json:"Plan Rows"`
+			NodeType     string  `json:"Node Type"`
+			RelationName string  `json:"Relation Name"`
+			PlanRows     float64 `json:"Plan Rows"`
 		} `json:"Plan"`
 	}
 	if err := json.Unmarshal([]byte(planJSON), &plans); err != nil {
