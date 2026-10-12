@@ -1,3 +1,4 @@
+// Package analyzer extracts and checks PostgreSQL queries in Go packages.
 package analyzer
 
 import (
@@ -14,6 +15,9 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
+// Run analyzes the packages matching cfg.Patterns and returns findings in
+// source order. It includes test files when cfg.Tests is set and enables
+// live database checks when cfg.DSN is set.
 func Run(ctx context.Context, cfg pgguard.Config) ([]pgguard.Finding, error) {
 	pkgs, err := loadPackages(cfg.Patterns, cfg.Tests)
 	if err != nil {

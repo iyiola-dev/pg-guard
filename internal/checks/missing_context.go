@@ -4,6 +4,8 @@ import (
 	pgguard "github.com/iyiola-dev/pg-guard"
 )
 
+// CheckMissingContext returns warnings for calls known to execute or prepare
+// statements without a context. Calls that only build SQL are skipped.
 func CheckMissingContext(queries []pgguard.ExtractedQuery) []pgguard.Finding {
 	var findings []pgguard.Finding
 

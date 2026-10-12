@@ -2,99 +2,148 @@ package pgguard
 
 import "go/token"
 
+// Severity is the diagnostic level of a [Finding].
 type Severity string
 
 const (
-	SeverityError   Severity = "error"
+	// SeverityError identifies a correctness or SQL construction problem.
+	SeverityError Severity = "error"
+	// SeverityWarning identifies a potential runtime risk or incomplete analysis.
 	SeverityWarning Severity = "warning"
-	SeverityInfo    Severity = "info"
+	// SeverityInfo identifies an opportunity to improve query performance.
+	SeverityInfo Severity = "info"
 )
 
+// CheckName identifies the analysis that produced a [Finding].
 type CheckName string
 
 const (
+	// CheckUnparameterizedQuery identifies SQL constructed from dynamic values.
 	CheckUnparameterizedQuery CheckName = "unparameterized-query"
-	CheckMissingContext       CheckName = "missing-context"
-	CheckNPlusOne             CheckName = "n-plus-one"
-	CheckMissingIndex         CheckName = "missing-index"
-	CheckFullTableScan        CheckName = "full-table-scan"
-	CheckInvalidSQL           CheckName = "invalid-sql"
-	CheckInvalidSchema        CheckName = "invalid-schema"
-	CheckDBAnalysisFailed     CheckName = "db-analysis-failed"
+	// CheckMissingContext identifies database calls known to omit a context.
+	CheckMissingContext CheckName = "missing-context"
+	// CheckNPlusOne identifies query execution repeated by a loop.
+	CheckNPlusOne CheckName = "n-plus-one"
+	// CheckMissingIndex identifies a filtered sequential scan that may benefit
+	// from an index.
+	CheckMissingIndex CheckName = "missing-index"
+	// CheckFullTableScan identifies a query that scans most or all of a large table.
+	CheckFullTableScan CheckName = "full-table-scan"
+	// CheckInvalidSQL identifies SQL rejected by the PostgreSQL syntax parser.
+	CheckInvalidSQL CheckName = "invalid-sql"
+	// CheckInvalidSchema identifies references rejected by the connected
+	// database's schema.
+	CheckInvalidSchema CheckName = "invalid-schema"
+	// CheckDBAnalysisFailed identifies a query whose database analysis could
+	// not complete.
+	CheckDBAnalysisFailed CheckName = "db-analysis-failed"
 )
 
 // API identifies the database library a call belongs to.
 type API string
 
 const (
+	// APIDatabaseSQL identifies database/sql and compatible query interfaces.
 	APIDatabaseSQL API = "database/sql"
-	APIPgx         API = "pgx"
-	APIGORM        API = "gorm"
+	// APIPgx identifies pgx and compatible query interfaces.
+	APIPgx API = "pgx"
+	// APIGORM identifies GORM calls and SQL expressions.
+	APIGORM API = "gorm"
 )
 
 // CallKind describes what a database call does when it runs.
 type CallKind string
 
 const (
-	CallQuery   CallKind = "query"   // sends a statement to the database
-	CallPrepare CallKind = "prepare" // prepares a statement for later use
-	CallBuild   CallKind = "build"   // only assembles SQL, e.g. pgx Batch.Queue or GORM Where
+	// CallQuery sends a statement to the database.
+	CallQuery CallKind = "query"
+	// CallPrepare prepares a statement for later execution.
+	CallPrepare CallKind = "prepare"
+	// CallBuild assembles SQL without executing it, as with pgx Batch.Queue
+	// or GORM Where.
+	CallBuild CallKind = "build"
 )
 
 // SQLKind describes how much of a statement a call's SQL text holds.
 type SQLKind string
 
 const (
-	SQLNone      SQLKind = ""          // no SQL text, e.g. stmt.Query or GORM First without conditions
-	SQLStatement SQLKind = "statement" // a complete statement
-	SQLFragment  SQLKind = "fragment"  // part of a statement, e.g. a GORM Where condition
+	// SQLNone indicates a call without SQL text, such as prepared statement execution.
+	SQLNone SQLKind = ""
+	// SQLStatement indicates a complete SQL statement.
+	SQLStatement SQLKind = "statement"
+	// SQLFragment indicates part of a statement, such as a GORM Where condition.
+	SQLFragment SQLKind = "fragment"
 )
 
 // BuildMethod describes how a query's SQL text is produced.
 type BuildMethod string
 
 const (
-	BuildConstant BuildMethod = "constant" // only from compile-time constants
-	BuildSprintf  BuildMethod = "sprintf"  // fmt.Sprintf with non-constant arguments
-	BuildConcat   BuildMethod = "concat"   // concatenation with non-constant operands
-	BuildUnknown  BuildMethod = "unknown"  // not determinable statically
+	// BuildConstant indicates construction from constant values, even when
+	// control flow obscures the final text.
+	BuildConstant BuildMethod = "constant"
+	// BuildSprintf indicates fmt.Sprintf with non-constant arguments.
+	BuildSprintf BuildMethod = "sprintf"
+	// BuildConcat indicates concatenation with non-constant operands.
+	BuildConcat BuildMethod = "concat"
+	// BuildUnknown indicates that SQL construction could not be determined statically.
+	BuildUnknown BuildMethod = "unknown"
 )
 
+// ExtractedQuery describes a database call and the SQL known about it statically.
 type ExtractedQuery struct {
-	Pos      token.Position
-	TokenPos token.Pos // Pos in the FileSet the query was extracted from
+	// Pos locates the called method or function in the source.
+	Pos token.Position
+	// TokenPos locates Pos in the file set used for extraction.
+	TokenPos token.Pos
 	API      API
-	FuncName string // method called, e.g. "QueryContext", "Where"
+	// FuncName is the called method or function name, such as QueryContext or Where.
+	FuncName string
 	Call     CallKind
-	// HasContext is false only when the call is known to run without a
-	// context.Context.
+	// HasContext is false only for calls known to run without a context.
+	// A true value also covers SQL builders and calls whose context is unknown.
 	HasContext bool
-	InLoop     bool
+	// InLoop reports whether the call appears in an enclosing loop's body,
+	// condition, or post statement.
+	InLoop bool
 
-	Kind   SQLKind
-	Clause string // clause of a fragment, e.g. "WHERE" or "ORDER BY"
-	// SQL is the query text as written, with Go escapes decoded. For
-	// dynamic SQL it is a template showing non-constant parts as {expr}.
+	Kind SQLKind
+	// Clause identifies the SQL clause of a fragment, such as WHERE or ORDER BY.
+	Clause string
+	// SQL contains decoded SQL text or a display template for dynamic SQL.
+	// It is empty when the text cannot be determined.
 	SQL string
-	// NormalizedSQL is SQL with bind placeholders rewritten to $1, $2, ...
-	// It is set only when the whole text is known at compile time.
+	// NormalizedSQL contains SQL rewritten to PostgreSQL bind syntax when the
+	// complete text is known. An empty value disables syntax and database checks.
 	NormalizedSQL string
 	BuildMethod   BuildMethod
 }
 
+// Finding is a diagnostic associated with a database call in the source.
 type Finding struct {
-	Pos          token.Position
-	TokenPos     token.Pos
-	Severity     Severity
-	Check        CheckName
-	Message      string
-	SQL          string
+	// Pos locates the call for text and JSON reports.
+	Pos token.Position
+	// TokenPos locates the call in the original file set for analysis diagnostics.
+	TokenPos token.Pos
+	Severity Severity
+	Check    CheckName
+	Message  string
+	// SQL contains the query text or display template, if available.
+	SQL string
+	// SuggestedFix describes a possible remedy; it is empty when none is known.
 	SuggestedFix string
 }
 
+// Config controls package loading, optional database analysis, and report output.
 type Config struct {
+	// Patterns contains Go package patterns accepted by go/packages.
 	Patterns []string
-	DSN      string
-	Format   string
-	Tests    bool // also analyze _test.go files
+	// DSN enables live database analysis when it contains a PostgreSQL
+	// connection string.
+	DSN string
+	// Format selects the CLI report format; "json" selects JSON output.
+	Format string
+	// Tests includes _test.go files in package analysis.
+	Tests bool
 }

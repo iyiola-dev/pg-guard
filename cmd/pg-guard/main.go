@@ -1,3 +1,4 @@
+// Command pg-guard checks Go packages for risky Postgres queries.
 package main
 
 import (

@@ -1,3 +1,5 @@
+// Package extractor identifies database calls and traces their SQL using Go
+// syntax and type information.
 package extractor
 
 import (
@@ -122,8 +124,12 @@ var gormMethods = map[string]gormMethod{
 	"FindInBatches":   gormFinisher,
 }
 
-// Extract returns the database calls in files, which must make up a single
-// package described by info.
+// Extract returns the database calls in files, which must belong to one package
+// and use fset. The type information in info must include expression types,
+// definitions, and uses for those files.
+//
+// Variable tracing is bounded and does not model execution order. Calls with
+// unresolved SQL remain available for context and loop checks.
 func Extract(fset *token.FileSet, files []*ast.File, info *types.Info) []pgguard.ExtractedQuery {
 	x := &extractor{
 		fset:     fset,
@@ -455,8 +461,8 @@ func (x *extractor) evalVar(id *ast.Ident, depth int) value {
 		return x.eval(a.expr, depth+1)
 	}
 
-	// The text depends on control flow, but the build method can still be
-	// told: SQL appended from non-constant values is dynamic.
+	// Control flow can obscure the final text while still exposing dynamic
+	// construction, such as appending a non-constant value.
 	result := value{method: pgguard.BuildConstant}
 	for _, a := range as.values {
 		if a.tuple {

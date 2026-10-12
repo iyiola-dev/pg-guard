@@ -48,6 +48,9 @@ type planOutcome struct {
 	err    error // Postgres rejected the EXPLAIN
 }
 
+// NewDBChecker returns a checker that uses db for live database analysis.
+// The caller retains ownership of db and must keep it open while the checker
+// is in use. Cached metadata and plans are not refreshed after schema changes.
 func NewDBChecker(db *dbinfo.DB) *DBChecker {
 	return &DBChecker{
 		db:     db,

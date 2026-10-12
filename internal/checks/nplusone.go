@@ -4,6 +4,8 @@ import (
 	pgguard "github.com/iyiola-dev/pg-guard"
 )
 
+// CheckNPlusOne returns warnings for query execution inside loops. The check
+// identifies repeated execution without inferring relationships between queries.
 func CheckNPlusOne(queries []pgguard.ExtractedQuery) []pgguard.Finding {
 	var findings []pgguard.Finding
 

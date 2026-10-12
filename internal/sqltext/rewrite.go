@@ -5,19 +5,21 @@ import (
 	"strings"
 )
 
-// Placeholders describes bind-parameter syntax other than Postgres' $N.
+// Placeholders describes bind syntax to normalize to PostgreSQL's $N parameters.
+// Its zero value leaves SQL unchanged.
 type Placeholders struct {
-	// Question is how many '?' placeholders are bound, counting from the
-	// start of the text as GORM does; -1 binds every one.
+	// Question is the number of '?' placeholders to bind from the start of
+	// the text, as GORM does. A negative value binds every placeholder.
 	Question int
-	// Named binds @name placeholders (GORM named arguments, pgx.NamedArgs).
+	// Named enables @name placeholders used by GORM and pgx named arguments.
 	Named bool
 }
 
 // Rewrite rewrites the placeholders described by p to $1, $2, ... so that
-// the Postgres parser and planner accept the text. Quoted strings, quoted
+// the PostgreSQL parser and planner accept the text. Quoted strings, quoted
 // identifiers and comments are left alone. A '?' directly after IN becomes
-// ($N), matching how GORM expands slice arguments.
+// ($N), matching how GORM expands slice arguments. Repeated named placeholders
+// share one parameter number.
 func Rewrite(sql string, p Placeholders) string {
 	if p.Question == 0 && !p.Named {
 		return sql

@@ -38,6 +38,15 @@ Thanks for your interest in contributing!
 - `extract/` holds calls whose extracted details `internal/extractor` checks, each marked with an `// @name` comment.
 - `github.com/jackc/pgx/v5/...` and `gorm.io/gorm/...` are minimal stand-ins for pgx and GORM with the same import paths and method signatures, so tests run without those modules.
 
+### Go documentation and comments
+
+Use these Go documentation conventions:
+
+- Document public packages, preferably in a `doc.go` file.
+- Start exported declaration comments with the declaration's name and use complete sentences.
+- Describe behavior, guarantees, and limitations. Use internal comments to explain intent, invariants, and non-obvious constraints; omit comments that restate the code.
+- Prefer testable examples to long code snippets in documentation comments.
+
 ## Submitting a Pull Request
 
 1. **Push** your branch to your fork:
