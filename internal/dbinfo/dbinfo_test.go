@@ -2,123 +2,83 @@ package dbinfo
 
 import (
 	"context"
-	"fmt"
+	"os"
 	"testing"
-	"time"
 
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
+	"github.com/iyiola-dev/pg-guard/internal/pgtest"
 )
 
-func setupPostgres(t *testing.T) (string, func()) {
-	t.Helper()
-	ctx := context.Background()
+const (
+	pg16 = "postgres:16-alpine"
+	pg15 = "postgres:15-alpine"
+)
 
-	req := testcontainers.ContainerRequest{
-		Image:        "postgres:16-alpine",
-		ExposedPorts: []string{"5432/tcp"},
-		Env: map[string]string{
-			"POSTGRES_USER":     "test",
-			"POSTGRES_PASSWORD": "test",
-			"POSTGRES_DB":       "testdb",
-		},
-		WaitingFor: wait.ForListeningPort("5432/tcp").WithStartupTimeout(60 * time.Second),
-	}
-
-	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: req,
-		Started:          true,
-	})
-	if err != nil {
-		t.Fatalf("failed to start postgres container: %v", err)
-	}
-
-	host, err := container.Host(ctx)
-	if err != nil {
-		t.Fatalf("failed to get container host: %v", err)
-	}
-	port, err := container.MappedPort(ctx, "5432")
-	if err != nil {
-		t.Fatalf("failed to get mapped port: %v", err)
-	}
-
-	dsn := fmt.Sprintf("postgres://test:test@%s:%s/testdb?sslmode=disable", host, port.Port())
-
-	cleanup := func() {
-		_ = container.Terminate(ctx)
-	}
-
-	return dsn, cleanup
+func TestMain(m *testing.M) {
+	code := m.Run()
+	pgtest.Stop()
+	os.Exit(code)
 }
 
-func seedSchema(t *testing.T, dsn string) {
-	t.Helper()
-	ctx := context.Background()
+var usersSchema = []string{
+	`CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL)`,
+	`CREATE INDEX idx_users_email ON users (email)`,
+	`INSERT INTO users (name, email) SELECT 'user' || i, 'user' || i || '@test.com' FROM generate_series(1, 100) AS i`,
+	`ANALYZE users`,
+}
 
+var plannerSchema = []string{
+	`CREATE TABLE users (id int PRIMARY KEY, name text NOT NULL, email text NOT NULL)`,
+	`CREATE TABLE orders (id int PRIMARY KEY, user_id int NOT NULL, amount int NOT NULL)`,
+	`INSERT INTO users SELECT i, 'user' || i, 'user' || i || '@test.com' FROM generate_series(1, 10000) AS i`,
+	`INSERT INTO orders SELECT i, i % 10000, i FROM generate_series(1, 20000) AS i`,
+	`ANALYZE`,
+}
+
+// open connects to a new database on a server running image, seeded with
+// statements.
+func open(t *testing.T, image string, statements ...string) (*DB, string) {
+	t.Helper()
+	dsn := pgtest.Database(t, image)
+	pgtest.Exec(t, dsn, statements...)
+
+	ctx := context.Background()
 	db, err := New(ctx, dsn)
 	if err != nil {
 		t.Fatalf("failed to connect: %v", err)
 	}
-	defer db.Close(ctx)
+	t.Cleanup(func() { db.Close(ctx) })
+	return db, dsn
+}
 
-	queries := []string{
-		`CREATE TABLE users (
-			id SERIAL PRIMARY KEY,
-			name TEXT NOT NULL,
-			email TEXT NOT NULL
-		)`,
-		`CREATE INDEX idx_users_email ON users (email)`,
-		`INSERT INTO users (name, email) SELECT 'user' || i, 'user' || i || '@test.com' FROM generate_series(1, 100) AS i`,
-		`ANALYZE users`,
+func TestTableExists(t *testing.T) {
+	db, _ := open(t, pg16, append(usersSchema,
+		`CREATE SCHEMA app`,
+		`CREATE TABLE app."MixedCase" (id int)`,
+	)...)
+
+	cases := map[string]bool{
+		"users":           true,
+		"public.users":    true,
+		`"users"`:         true,
+		"nonexistent":     false,
+		`app."MixedCase"`: true,
+		"app.mixedcase":   false,
+		`"MixedCase"`:     false, // app is not on the search path
 	}
-	for _, q := range queries {
-		_, err := db.conn.Exec(ctx, q)
+	for table, want := range cases {
+		exists, err := db.TableExists(context.Background(), table)
 		if err != nil {
-			t.Fatalf("seed query failed: %v\nquery: %s", err, q)
+			t.Fatalf("TableExists(%s): %v", table, err)
+		}
+		if exists != want {
+			t.Errorf("TableExists(%s) = %v, want %v", table, exists, want)
 		}
 	}
 }
 
-func TestTableExists(t *testing.T) {
-	dsn, cleanup := setupPostgres(t)
-	defer cleanup()
-	seedSchema(t, dsn)
-
-	ctx := context.Background()
-	db, err := New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("failed to connect: %v", err)
-	}
-	defer db.Close(ctx)
-
-	exists, err := db.TableExists(ctx, "users")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !exists {
-		t.Error("expected users table to exist")
-	}
-
-	exists, err = db.TableExists(ctx, "nonexistent")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if exists {
-		t.Error("expected nonexistent table to not exist")
-	}
-}
-
 func TestColumnExists(t *testing.T) {
-	dsn, cleanup := setupPostgres(t)
-	defer cleanup()
-	seedSchema(t, dsn)
-
+	db, _ := open(t, pg16, usersSchema...)
 	ctx := context.Background()
-	db, err := New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("failed to connect: %v", err)
-	}
-	defer db.Close(ctx)
 
 	exists, err := db.ColumnExists(ctx, "users", "email")
 	if err != nil {
@@ -159,18 +119,9 @@ func TestTableRowEstimate(t *testing.T) {
 }
 
 func TestTableIndexes(t *testing.T) {
-	dsn, cleanup := setupPostgres(t)
-	defer cleanup()
-	seedSchema(t, dsn)
+	db, _ := open(t, pg16, usersSchema...)
 
-	ctx := context.Background()
-	db, err := New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("failed to connect: %v", err)
-	}
-	defer db.Close(ctx)
-
-	indexes, err := db.TableIndexes(ctx, "users")
+	indexes, err := db.TableIndexes(context.Background(), "users")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -191,6 +142,9 @@ func TestTableIndexes(t *testing.T) {
 		t.Error("expected idx_users_email index")
 	}
 }
+
+func setupPostgres(t *testing.T) (string, func()) { return pgtest.Database(t, pg16), func() {} }
+func seedSchema(t *testing.T, dsn string)         { pgtest.Exec(t, dsn, usersSchema...) }
 
 func TestExplain(t *testing.T) {
 	dsn, cleanup := setupPostgres(t)
@@ -216,7 +170,6 @@ func TestExplain(t *testing.T) {
 		t.Error("expected seq scan for full table select")
 	}
 }
-
 func TestExplain_IndexScan(t *testing.T) {
 	dsn, cleanup := setupPostgres(t)
 	defer cleanup()
