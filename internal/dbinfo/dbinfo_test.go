@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/iyiola-dev/pg-guard/internal/pgtest"
 )
@@ -98,23 +99,45 @@ func TestColumnExists(t *testing.T) {
 }
 
 func TestTableRowEstimate(t *testing.T) {
-	dsn, cleanup := setupPostgres(t)
-	defer cleanup()
-	seedSchema(t, dsn)
-
+	db, _ := open(t, pg16, append(usersSchema,
+		`CREATE TABLE events (id int)`,
+		`INSERT INTO events SELECT generate_series(1, 5000)`,
+		`ANALYZE events`,
+	)...)
 	ctx := context.Background()
-	db, err := New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("failed to connect: %v", err)
-	}
-	defer db.Close(ctx)
 
 	estimate, err := db.TableRowEstimate(ctx, "users")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if estimate <= 0 {
-		t.Errorf("expected positive row estimate, got %d", estimate)
+	if estimate != 100 {
+		t.Errorf("users estimate = %d, want 100", estimate)
+	}
+
+	// Once the seeding session's statistics are flushed, n_live_tup counts
+	// the inserted rows a second time on top of ANALYZE's count. The
+	// estimate must not follow it.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var live int64
+		if err := db.conn.QueryRow(ctx, "SELECT n_live_tup FROM pg_stat_user_tables WHERE relname = 'events'").Scan(&live); err != nil {
+			t.Fatal(err)
+		}
+		if live > 5000 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	estimate, err = db.TableRowEstimate(ctx, "events")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if estimate != 5000 {
+		t.Errorf("events estimate = %d, want 5000", estimate)
+	}
+
+	if _, err := db.TableRowEstimate(ctx, "nonexistent"); err == nil {
+		t.Error("expected an error for a missing table")
 	}
 }
 

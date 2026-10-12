@@ -37,11 +37,21 @@ func (db *DB) Close(ctx context.Context) error {
 	return db.conn.Close(ctx)
 }
 
+// TableRowEstimate estimates a table's rows the way the planner does,
+// scaling the density recorded by the last VACUUM or ANALYZE to the
+// table's current size. Tables never analyzed fall back to the statistics
+// collector's live row count.
 func (db *DB) TableRowEstimate(ctx context.Context, table string) (int64, error) {
 	var estimate int64
-	err := db.conn.QueryRow(ctx,
-		"SELECT n_live_tup FROM pg_stat_user_tables WHERE relname = $1", table,
-	).Scan(&estimate)
+	err := db.conn.QueryRow(ctx, `
+		SELECT CASE
+			WHEN c.reltuples < 0 OR c.relpages = 0 THEN GREATEST(c.reltuples, COALESCE(s.n_live_tup, 0))
+			ELSE c.reltuples / c.relpages * (pg_relation_size(c.oid) / current_setting('block_size')::int)
+		END::bigint
+		FROM pg_class c
+		LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid
+		WHERE c.oid = to_regclass($1)
+	`, table).Scan(&estimate)
 	if err != nil {
 		return 0, fmt.Errorf("dbinfo: row estimate for %q: %w", table, err)
 	}
