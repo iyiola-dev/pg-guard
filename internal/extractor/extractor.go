@@ -6,6 +6,8 @@ import (
 	"go/constant"
 	"go/token"
 	"go/types"
+	"strconv"
+	"strings"
 
 	pgguard "github.com/iyiola-dev/pg-guard"
 	"github.com/iyiola-dev/pg-guard/internal/sqltext"
@@ -64,6 +66,60 @@ var pgxMethods = map[string]method{
 	"QueryRow": {pgguard.CallQuery, true, 1},
 	"Exec":     {pgguard.CallQuery, true, 1},
 	"Prepare":  {pgguard.CallPrepare, true, 2},
+}
+
+// gormMethod says what a *gorm.DB method does with its arguments.
+type gormMethod struct {
+	call   pgguard.CallKind
+	sqlArg int // index of the SQL argument when kind is not SQLNone
+	kind   pgguard.SQLKind
+	clause string
+	cond   bool // the SQL argument is a condition, interpreted as Where does
+}
+
+var (
+	gormCond       = gormMethod{call: pgguard.CallBuild, kind: pgguard.SQLFragment, clause: sqltext.ClauseWhere, cond: true}
+	gormInlineCond = gormMethod{call: pgguard.CallQuery, sqlArg: 1, kind: pgguard.SQLFragment, clause: sqltext.ClauseWhere, cond: true}
+	gormJoin       = gormMethod{call: pgguard.CallBuild, kind: pgguard.SQLFragment, clause: sqltext.ClauseJoin}
+	gormFinisher   = gormMethod{call: pgguard.CallQuery}
+)
+
+var gormMethods = map[string]gormMethod{
+	"Raw":    {call: pgguard.CallBuild, kind: pgguard.SQLStatement},
+	"Exec":   {call: pgguard.CallQuery, kind: pgguard.SQLStatement},
+	"Where":  gormCond,
+	"Or":     gormCond,
+	"Not":    gormCond,
+	"Having": {call: pgguard.CallBuild, kind: pgguard.SQLFragment, clause: sqltext.ClauseHaving, cond: true},
+	"Select": {call: pgguard.CallBuild, kind: pgguard.SQLFragment, clause: sqltext.ClauseSelect},
+	"Order":  {call: pgguard.CallBuild, kind: pgguard.SQLFragment, clause: sqltext.ClauseOrderBy},
+	"Group":  {call: pgguard.CallBuild, kind: pgguard.SQLFragment, clause: sqltext.ClauseGroupBy},
+	"Table":  {call: pgguard.CallBuild, kind: pgguard.SQLFragment, clause: sqltext.ClauseFrom},
+	"Pluck":  {call: pgguard.CallQuery, kind: pgguard.SQLFragment, clause: sqltext.ClauseSelect},
+
+	"Joins":      gormJoin,
+	"InnerJoins": gormJoin,
+
+	"First":         gormInlineCond,
+	"Take":          gormInlineCond,
+	"Last":          gormInlineCond,
+	"Find":          gormInlineCond,
+	"FirstOrInit":   gormInlineCond,
+	"FirstOrCreate": gormInlineCond,
+	"Delete":        gormInlineCond,
+
+	"Scan":            gormFinisher,
+	"Row":             gormFinisher,
+	"Rows":            gormFinisher,
+	"Count":           gormFinisher,
+	"Create":          gormFinisher,
+	"CreateInBatches": gormFinisher,
+	"Save":            gormFinisher,
+	"Update":          gormFinisher,
+	"Updates":         gormFinisher,
+	"UpdateColumn":    gormFinisher,
+	"UpdateColumns":   gormFinisher,
+	"FindInBatches":   gormFinisher,
 }
 
 // Extract returns the database calls in files, which must make up a single
@@ -151,6 +207,10 @@ func (x *extractor) classify(call *ast.CallExpr, fn *types.Func) (pgguard.Extrac
 		if m, ok := pgxMethods[fn.Name()]; ok && matches(sig, m) {
 			return x.direct(call, pgguard.APIPgx, m), true
 		}
+	case pkg == pkgGORM && recv == "DB":
+		return x.gorm(call, fn.Name())
+	case pkg == pkgGORM && sig.Recv() == nil && fn.Name() == "Expr":
+		return x.gormSQL(call, gormMethod{call: pgguard.CallBuild, kind: pgguard.SQLFragment, clause: sqltext.ClauseSelect})
 	case sig.Recv() != nil:
 		return x.structural(call, fn.Name(), sig)
 	}
@@ -182,6 +242,153 @@ func (x *extractor) direct(call *ast.CallExpr, api pgguard.API, m method) pgguar
 	}
 	setSQL(&q, x.eval(call.Args[m.sqlArg], 0), pgguard.SQLStatement, "", p, true)
 	return q
+}
+
+func (x *extractor) gorm(call *ast.CallExpr, name string) (pgguard.ExtractedQuery, bool) {
+	m, ok := gormMethods[name]
+	if !ok {
+		return pgguard.ExtractedQuery{}, false
+	}
+	q, hasSQL := x.gormSQL(call, m)
+	if m.call != pgguard.CallQuery {
+		return q, hasSQL
+	}
+	q.HasContext = x.gormContext(ast.Unparen(call.Fun).(*ast.SelectorExpr).X)
+	return q, true
+}
+
+// gormSQL describes the SQL text a GORM call takes, reporting false when
+// the call takes none.
+func (x *extractor) gormSQL(call *ast.CallExpr, m gormMethod) (pgguard.ExtractedQuery, bool) {
+	q := pgguard.ExtractedQuery{API: pgguard.APIGORM, Call: m.call, HasContext: true}
+	if m.kind == pgguard.SQLNone || m.sqlArg >= len(call.Args) {
+		return q, false
+	}
+	arg := call.Args[m.sqlArg]
+	if !isString(x.info.TypeOf(arg)) {
+		return q, false // e.g. Where(&User{Name: name}) or Order(clause.OrderByColumn{...})
+	}
+
+	vars := call.Args[m.sqlArg+1:]
+	bound := len(vars)
+	if call.Ellipsis.IsValid() {
+		bound = -1
+	}
+	v := x.eval(arg, 0)
+	if v.exact && !gormIsSQL(v.text, m, bound) {
+		return q, false
+	}
+	p := sqltext.Placeholders{Question: bound, Named: bound != 0 && strings.Contains(v.text, "@")}
+	setSQL(&q, v, m.kind, m.clause, p, !x.expandsToSQL(vars))
+	return q, true
+}
+
+// gormIsSQL reports whether GORM reads text as SQL rather than as a primary
+// key, column name or association name.
+func gormIsSQL(text string, m gormMethod, bound int) bool {
+	trimmed := strings.TrimSpace(text)
+	switch {
+	case trimmed == "":
+		return false
+	case m.cond:
+		if _, err := strconv.Atoi(text); err == nil {
+			return false // a primary key
+		}
+		return bound == 0 || strings.ContainsAny(text, "?@") || strings.ContainsAny(trimmed, " \t\n")
+	case m.clause == sqltext.ClauseJoin:
+		return strings.ContainsAny(trimmed, " \t\n") // otherwise an association name
+	}
+	return true
+}
+
+// expandsToSQL reports whether any argument is spliced into the SQL as text
+// rather than bound as a value, as GORM does with subqueries and clause
+// expressions.
+func (x *extractor) expandsToSQL(args []ast.Expr) bool {
+	for _, a := range args {
+		if path := typePkg(x.info.TypeOf(a)); path == pkgGORM || path == pkgGORMClause {
+			return true
+		}
+	}
+	return false
+}
+
+// gormContext reports whether the GORM chain e carries a context. A chain
+// whose origin cannot be traced, such as a *gorm.DB parameter or the tx of a
+// Transaction callback, counts as carrying one, so only definite omissions
+// are reported.
+func (x *extractor) gormContext(e ast.Expr) bool {
+	for range maxDepth {
+		switch n := ast.Unparen(e).(type) {
+		case *ast.CallExpr:
+			sel, ok := ast.Unparen(n.Fun).(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			fn, ok := x.info.Uses[sel.Sel].(*types.Func)
+			if !ok || fn.Pkg() == nil || fn.Pkg().Path() != pkgGORM {
+				return true
+			}
+			switch fn.Name() {
+			case "WithContext":
+				return true
+			case "Open":
+				return false
+			case "Session":
+				if hasCtx, known := sessionContext(n); hasCtx || !known {
+					return true
+				}
+			}
+			if fn.Type().(*types.Signature).Recv() == nil {
+				return true
+			}
+			e = sel.X
+		case *ast.SelectorExpr:
+			// Struct fields and package variables hold long-lived handles.
+			v, ok := x.info.Uses[n.Sel].(*types.Var)
+			return !ok || !(v.IsField() || isPackageLevel(v))
+		case *ast.Ident:
+			v, ok := x.info.Uses[n].(*types.Var)
+			if !ok {
+				return true
+			}
+			if isPackageLevel(v) {
+				return false
+			}
+			as := x.assigns[v]
+			if as == nil || as.escaped || len(as.values) != 1 || as.values[0].expr == nil || as.values[0].append {
+				return true
+			}
+			e = as.values[0].expr
+		default:
+			return true
+		}
+	}
+	return true
+}
+
+// sessionContext reports whether a Session(&gorm.Session{...}) call sets a
+// Context, and whether that could be determined.
+func sessionContext(call *ast.CallExpr) (hasCtx, known bool) {
+	if len(call.Args) != 1 {
+		return false, false
+	}
+	arg := ast.Unparen(call.Args[0])
+	if u, ok := arg.(*ast.UnaryExpr); ok && u.Op == token.AND {
+		arg = ast.Unparen(u.X)
+	}
+	lit, ok := arg.(*ast.CompositeLit)
+	if !ok {
+		return false, false
+	}
+	for _, elt := range lit.Elts {
+		if kv, ok := elt.(*ast.KeyValueExpr); ok {
+			if id, ok := kv.Key.(*ast.Ident); ok && id.Name == "Context" {
+				return true, true
+			}
+		}
+	}
+	return false, true
 }
 
 func (x *extractor) isNamedArgs(e ast.Expr) bool {
