@@ -5,7 +5,6 @@ import (
 
 	pgguard "github.com/iyiola-dev/pg-guard"
 	"github.com/iyiola-dev/pg-guard/internal/sqltext"
-	pgquery "github.com/pganalyze/pg_query_go/v5"
 )
 
 func CheckInvalidSQL(queries []pgguard.ExtractedQuery) []pgguard.Finding {
@@ -20,7 +19,7 @@ func CheckInvalidSQL(queries []pgguard.ExtractedQuery) []pgguard.Finding {
 		if q.Kind == pgguard.SQLFragment {
 			sql, msg = sqltext.Statement(sql, q.Clause), "invalid SQL syntax in "+q.Clause+" fragment: %v"
 		}
-		if _, err := pgquery.Parse(sql); err != nil {
+		if _, err := sqltext.Inspect(sql); err != nil {
 			findings = append(findings, pgguard.Finding{
 				Pos:      q.Pos,
 				TokenPos: q.TokenPos,

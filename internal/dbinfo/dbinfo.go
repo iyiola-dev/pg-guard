@@ -15,12 +15,48 @@ type IndexInfo struct {
 	Unique  bool
 }
 
-type ExplainResult struct {
-	SeqScan   bool
-	TableName string
-	RowCount  int64
+// PlanNode is a node of a JSON EXPLAIN plan.
+type PlanNode struct {
+	NodeType       string      `json:"Node Type"`
+	RelationName   string      `json:"Relation Name"`
+	Schema         string      `json:"Schema"`
+	Alias          string      `json:"Alias"`
+	Filter         string      `json:"Filter"`
+	PlanRows       float64     `json:"Plan Rows"`
+	ParallelAware  bool        `json:"Parallel Aware"`
+	WorkersPlanned int         `json:"Workers Planned"`
+	Plans          []*PlanNode `json:"Plans"`
 }
 
+type ExplainResult struct {
+	Plan *PlanNode
+}
+
+// SeqScan is a sequential scan found in a plan.
+type SeqScan struct {
+	Schema   string
+	Relation string
+	Filter   string
+	// Rows is the planner's estimate of the rows the scan returns, summed
+	// over parallel workers.
+	Rows float64
+	// Limited reports that a Limit directly above the scan can stop it
+	// before it reads the whole table.
+	Limited bool
+}
+
+// SeqScans returns the sequential scan at the root of the plan, if any.
+func (r *ExplainResult) SeqScans() []SeqScan {
+	p := r.Plan
+	if p == nil || p.NodeType != "Seq Scan" {
+		return nil
+	}
+	return []SeqScan{{Schema: p.Schema, Relation: p.RelationName, Filter: p.Filter, Rows: p.PlanRows}}
+}
+
+// DB inspects a live database. Table names passed to its methods are SQL
+// names, optionally schema-qualified and quoted, resolved through the search
+// path. It is not safe for concurrent use.
 type DB struct {
 	conn *pgx.Conn
 }
@@ -109,32 +145,21 @@ func (db *DB) ColumnExists(ctx context.Context, table, column string) (bool, err
 	return exists, nil
 }
 
+// Explain returns the root plan for query without running the statement.
 func (db *DB) Explain(ctx context.Context, query string) (*ExplainResult, error) {
-	var planJSON string
-	err := db.conn.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+query).Scan(&planJSON)
-	if err != nil {
+	var planJSON []byte
+	if err := db.conn.QueryRow(ctx, "EXPLAIN (FORMAT JSON, VERBOSE) "+query).Scan(&planJSON); err != nil {
 		return nil, fmt.Errorf("dbinfo: explain: %w", err)
 	}
 
 	var plans []struct {
-		Plan struct {
-			NodeType     string  `json:"Node Type"`
-			RelationName string  `json:"Relation Name"`
-			PlanRows     float64 `json:"Plan Rows"`
-		} `json:"Plan"`
+		Plan *PlanNode `json:"Plan"`
 	}
-	if err := json.Unmarshal([]byte(planJSON), &plans); err != nil {
+	if err := json.Unmarshal(planJSON, &plans); err != nil {
 		return nil, fmt.Errorf("dbinfo: parse explain: %w", err)
 	}
-
 	if len(plans) == 0 {
 		return &ExplainResult{}, nil
 	}
-
-	p := plans[0].Plan
-	return &ExplainResult{
-		SeqScan:   p.NodeType == "Seq Scan",
-		TableName: p.RelationName,
-		RowCount:  int64(p.PlanRows),
-	}, nil
+	return &ExplainResult{Plan: plans[0].Plan}, nil
 }

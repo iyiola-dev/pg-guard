@@ -80,7 +80,6 @@ type ExtractedQuery struct {
 	// It is set only when the whole text is known at compile time.
 	NormalizedSQL string
 	BuildMethod   BuildMethod
-	Tables        []string
 }
 
 type Finding struct {
