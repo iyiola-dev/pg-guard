@@ -61,3 +61,23 @@ func TestDBChecker_MissingTable(t *testing.T) {
 		t.Errorf("finding does not identify the original call site: %+v", finding)
 	}
 }
+
+func TestDBChecker_NestedScan(t *testing.T) {
+	checker := regressionDBChecker(t,
+		`CREATE TABLE regression_nested_scan (id int NOT NULL, sort_value int NOT NULL)`,
+		`INSERT INTO regression_nested_scan SELECT i, 120001 - i FROM generate_series(1, 120000) AS i`,
+		`ANALYZE regression_nested_scan`,
+	)
+	query := regressionQuery("SELECT id FROM regression_nested_scan ORDER BY sort_value", 20)
+	findings := regressionCheck(t, checker, query)
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want one scan beneath Sort: %+v", len(findings), findings)
+	}
+	finding := findings[0]
+	if finding.Check != pgguard.CheckFullTableScan || finding.Severity != pgguard.SeverityInfo {
+		t.Errorf("got %s/%s, want full-table-scan/info", finding.Check, finding.Severity)
+	}
+	if finding.Pos != query.Pos || finding.SQL != query.SQL {
+		t.Errorf("finding does not identify the original call site: %+v", finding)
+	}
+}
