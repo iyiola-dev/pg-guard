@@ -1,3 +1,5 @@
+// Package checks reports static SQL construction, syntax, context, and loop risks
+// from extracted database calls.
 package checks
 
 import (
@@ -7,6 +9,8 @@ import (
 	"github.com/iyiola-dev/pg-guard/internal/sqltext"
 )
 
+// CheckInvalidSQL returns syntax errors for queries with normalized SQL.
+// Dynamic or unresolved SQL is skipped. Fragments are parsed in clause context.
 func CheckInvalidSQL(queries []pgguard.ExtractedQuery) []pgguard.Finding {
 	var findings []pgguard.Finding
 

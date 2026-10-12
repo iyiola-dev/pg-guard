@@ -1,3 +1,5 @@
+// Package sqltext normalizes bind parameters and inspects PostgreSQL syntax
+// without connecting to a database.
 package sqltext
 
 import (
@@ -8,19 +10,26 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
-// Clauses a GORM fragment can belong to.
 const (
-	ClauseWhere   = "WHERE"
-	ClauseHaving  = "HAVING"
+	// ClauseWhere identifies a row filter.
+	ClauseWhere = "WHERE"
+	// ClauseHaving identifies a filter on grouped rows.
+	ClauseHaving = "HAVING"
+	// ClauseOrderBy identifies result ordering.
 	ClauseOrderBy = "ORDER BY"
+	// ClauseGroupBy identifies grouping expressions.
 	ClauseGroupBy = "GROUP BY"
-	ClauseSelect  = "SELECT"
-	ClauseFrom    = "FROM"
-	ClauseJoin    = "JOIN"
+	// ClauseSelect identifies a projection list.
+	ClauseSelect = "SELECT"
+	// ClauseFrom identifies a relation expression.
+	ClauseFrom = "FROM"
+	// ClauseJoin identifies a join expression.
+	ClauseJoin = "JOIN"
 )
 
 // Statement embeds a clause fragment in a minimal statement so that the
-// Postgres parser can check it.
+// PostgreSQL parser can check its syntax. The returned statement is a parsing
+// wrapper and is not intended for execution.
 func Statement(fragment, clause string) string {
 	switch clause {
 	case ClauseSelect:
@@ -36,11 +45,12 @@ func Statement(fragment, clause string) string {
 
 // Table is a relation named in a statement.
 type Table struct {
+	// Schema is empty for an unqualified relation.
 	Schema string
 	Name   string
 }
 
-// String returns the table as a SQL name, quoting the parts that need it.
+// String formats the relation name with schema qualification when present.
 func (t Table) String() string {
 	if t.Schema == "" {
 		return quoteIdent(t.Name)
@@ -50,21 +60,24 @@ func (t Table) String() string {
 
 // Info describes parsed SQL.
 type Info struct {
+	// Statements counts the statements in the parsed text.
 	Statements int
 	// Command is SELECT, INSERT, UPDATE, DELETE or MERGE when the text is a
 	// single such statement, and empty otherwise.
 	Command string
-	// Tables are the relations Command reads or writes, excluding CTEs.
+	// Tables lists distinct relations read or written by Command, excluding CTEs.
+	// It is empty when Command is empty.
 	Tables []Table
 	// Created are the relations created by CREATE TABLE, CREATE VIEW and
 	// SELECT INTO statements.
 	Created []Table
-	// Params is the highest $N placeholder number.
+	// Params is the highest $N placeholder number, or zero when none appears.
 	Params int
 }
 
-// Inspect parses sql with the Postgres parser. A returned error describes
-// a syntax error.
+// Inspect parses sql and returns statement, relation, and parameter metadata.
+// It checks syntax without validating references against a database schema.
+// A returned error describes a syntax error.
 func Inspect(sql string) (*Info, error) {
 	tree, err := pgquery.Parse(sql)
 	if err != nil {
@@ -93,7 +106,8 @@ func Inspect(sql string) (*Info, error) {
 }
 
 // FilterColumns returns the columns referenced by a filter condition from
-// an EXPLAIN plan, in order of first appearance.
+// an EXPLAIN plan, in order of first appearance. Qualifiers and duplicate names
+// are removed. It returns nil when the condition cannot be parsed.
 func FilterColumns(filter string) []string {
 	tree, err := pgquery.Parse("SELECT 1 WHERE " + filter)
 	if err != nil {

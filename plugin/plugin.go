@@ -17,17 +17,20 @@ func init() {
 	register.Plugin("pgguard", New)
 }
 
-// Settings configure the analyzer. golangci-lint reads them from
+// Settings configures the analyzer. golangci-lint reads these settings from
 // linters.settings.custom.pgguard.settings.
 type Settings struct {
-	// DSN enables the live database checks. When empty, PG_GUARD_DSN is used.
+	// DSN is the Postgres connection string for live database checks.
+	// An empty value uses PG_GUARD_DSN; if both are empty, only static checks run.
 	DSN string `json:"dsn"`
 }
 
-// Analyzer runs pg-guard's static checks, and its live database checks
-// when PG_GUARD_DSN is set.
+// Analyzer runs pg-guard's static checks and enables live database checks when
+// PG_GUARD_DSN is set on its first run.
 var Analyzer = NewAnalyzer(Settings{})
 
+// NewAnalyzer returns an analyzer configured with s.
+// It connects to Postgres on its first run when live database checks are enabled.
 func NewAnalyzer(s Settings) *analysis.Analyzer {
 	r := &runner{settings: s}
 	return &analysis.Analyzer{
@@ -37,7 +40,8 @@ func NewAnalyzer(s Settings) *analysis.Analyzer {
 	}
 }
 
-// New is the entry point for golangci-lint's module plugin system.
+// New returns a golangci-lint module plugin configured from conf.
+// It returns an error if conf contains invalid or unknown settings.
 func New(conf any) (register.LinterPlugin, error) {
 	s, err := register.DecodeSettings[Settings](conf)
 	if err != nil {
@@ -50,10 +54,12 @@ type linter struct {
 	settings Settings
 }
 
+// BuildAnalyzers returns the analyzers configured with the plugin's settings.
 func (l *linter) BuildAnalyzers() ([]*analysis.Analyzer, error) {
 	return []*analysis.Analyzer{NewAnalyzer(l.settings)}, nil
 }
 
+// GetLoadMode returns the load mode needed to identify database calls by type.
 func (l *linter) GetLoadMode() string {
 	return register.LoadModeTypesInfo
 }
@@ -92,8 +98,7 @@ func (r *runner) run(pass *analysis.Pass) (interface{}, error) {
 	return nil, nil
 }
 
-// dbChecker connects on first use and shares the connection between
-// packages for the life of the process.
+// dbChecker initializes the live database checker once for this runner.
 func (r *runner) dbChecker() (*analyzer.DBChecker, error) {
 	r.once.Do(func() {
 		dsn := r.settings.DSN

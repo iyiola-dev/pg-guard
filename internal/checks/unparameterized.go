@@ -4,6 +4,9 @@ import (
 	pgguard "github.com/iyiola-dev/pg-guard"
 )
 
+// CheckUnparameterized returns errors for SQL constructed with non-constant
+// concatenation or fmt.Sprintf arguments. It does not determine whether the
+// interpolated values are untrusted.
 func CheckUnparameterized(queries []pgguard.ExtractedQuery) []pgguard.Finding {
 	var findings []pgguard.Finding
 

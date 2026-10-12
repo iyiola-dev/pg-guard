@@ -74,7 +74,8 @@ func Exec(t testing.TB, dsn string, statements ...string) {
 	}
 }
 
-// Stop removes the servers started by Database. Call it from TestMain.
+// Stop removes the servers started by Database. Call it from TestMain after
+// all tests and their cleanup functions have completed.
 func Stop() {
 	mu.Lock()
 	defer mu.Unlock()

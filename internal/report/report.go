@@ -1,3 +1,4 @@
+// Package report formats analysis findings for text and JSON output.
 package report
 
 import (
@@ -8,6 +9,8 @@ import (
 	pgguard "github.com/iyiola-dev/pg-guard"
 )
 
+// Text writes one line per finding to w in the supplied order.
+// It returns the first write error.
 func Text(findings []pgguard.Finding, w io.Writer) error {
 	for _, f := range findings {
 		_, err := fmt.Fprintf(w, "%s:%d:%d  %-7s  %-25s  %s\n",
@@ -32,6 +35,8 @@ type jsonFinding struct {
 	SuggestedFix string `json:"suggested_fix,omitempty"`
 }
 
+// JSON writes findings to w as an indented JSON array in the supplied order.
+// An empty input produces an empty array. It returns any encoding or write error.
 func JSON(findings []pgguard.Finding, w io.Writer) error {
 	out := make([]jsonFinding, len(findings))
 	for i, f := range findings {

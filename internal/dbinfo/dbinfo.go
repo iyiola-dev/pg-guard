@@ -1,3 +1,4 @@
+// Package dbinfo inspects PostgreSQL schema metadata and query plans.
 package dbinfo
 
 import (
@@ -11,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// IndexInfo describes an index's columns and uniqueness.
 type IndexInfo struct {
 	Name    string
 	Table   string
@@ -31,6 +33,7 @@ type PlanNode struct {
 	Plans          []*PlanNode `json:"Plans"`
 }
 
+// ExplainResult contains the plan returned by PostgreSQL EXPLAIN.
 type ExplainResult struct {
 	Plan *PlanNode
 }
@@ -95,6 +98,8 @@ type DB struct {
 	version int // server_version_num
 }
 
+// New connects to the PostgreSQL database identified by dsn.
+// The caller must close the returned DB when it is no longer needed.
 func New(ctx context.Context, dsn string) (*DB, error) {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
@@ -108,6 +113,7 @@ func New(ctx context.Context, dsn string) (*DB, error) {
 	return &DB{conn: conn, version: version}, nil
 }
 
+// Close closes the database connection.
 func (db *DB) Close(ctx context.Context) error {
 	return db.conn.Close(ctx)
 }
@@ -133,6 +139,9 @@ func (db *DB) TableRowEstimate(ctx context.Context, table string) (int64, error)
 	return estimate, nil
 }
 
+// TableIndexes returns the indexes on table in index-name order.
+// Columns contains the ordinary table columns stored in each index;
+// index expressions are omitted.
 func (db *DB) TableIndexes(ctx context.Context, table string) ([]IndexInfo, error) {
 	rows, err := db.conn.Query(ctx, `
 		SELECT i.relname, ix.indisunique, array_agg(a.attname ORDER BY k.n)
@@ -161,6 +170,7 @@ func (db *DB) TableIndexes(ctx context.Context, table string) ([]IndexInfo, erro
 	return indexes, rows.Err()
 }
 
+// TableExists reports whether table resolves to a relation in the database.
 func (db *DB) TableExists(ctx context.Context, table string) (bool, error) {
 	var exists bool
 	err := db.conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", table).Scan(&exists)
@@ -170,6 +180,8 @@ func (db *DB) TableExists(ctx context.Context, table string) (bool, error) {
 	return exists, nil
 }
 
+// ColumnExists reports whether table has a column with the given name.
+// The column name is matched exactly, without SQL identifier normalization.
 func (db *DB) ColumnExists(ctx context.Context, table, column string) (bool, error) {
 	var exists bool
 	err := db.conn.QueryRow(ctx, `
