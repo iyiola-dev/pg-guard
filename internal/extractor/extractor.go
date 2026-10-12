@@ -4,7 +4,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
-	"strings"
+	"strconv"
 
 	pgguard "github.com/iyiola-dev/pg-guard"
 	"github.com/iyiola-dev/pg-guard/internal/sqltext"
@@ -210,7 +210,10 @@ func (x *extractor) eval(e ast.Expr, depth int) value {
 	switch e := ast.Unparen(e).(type) {
 	case *ast.BasicLit:
 		if e.Kind == token.STRING {
-			return value{text: strings.Trim(e.Value, "\"`"), method: pgguard.BuildConstant, exact: true}
+			text, err := strconv.Unquote(e.Value)
+			if err == nil {
+				return value{text: text, method: pgguard.BuildConstant, exact: true}
+			}
 		}
 	case *ast.BinaryExpr:
 		if e.Op == token.ADD {
