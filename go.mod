@@ -3,6 +3,7 @@ module github.com/iyiola-dev/pg-guard
 go 1.25.0
 
 require (
+	github.com/golangci/plugin-module-register v0.1.2
 	github.com/jackc/pgx/v5 v5.8.0
 	github.com/pganalyze/pg_query_go/v5 v5.1.0
 	github.com/testcontainers/testcontainers-go v0.41.0
