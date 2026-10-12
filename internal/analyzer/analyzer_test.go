@@ -2,99 +2,96 @@ package analyzer
 
 import (
 	"context"
-	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
-	"time"
 
 	pgguard "github.com/iyiola-dev/pg-guard"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
+	"github.com/iyiola-dev/pg-guard/internal/pgtest"
 )
 
-func setupPostgres(t *testing.T) (string, func()) {
+func TestMain(m *testing.M) {
+	code := m.Run()
+	pgtest.Stop()
+	os.Exit(code)
+}
+
+type result struct {
+	file  string
+	check pgguard.CheckName
+	text  string // part of the message
+}
+
+func run(t *testing.T, cfg pgguard.Config) []result {
 	t.Helper()
-	ctx := context.Background()
-
-	req := testcontainers.ContainerRequest{
-		Image:        "postgres:16-alpine",
-		ExposedPorts: []string{"5432/tcp"},
-		Env: map[string]string{
-			"POSTGRES_USER":     "test",
-			"POSTGRES_PASSWORD": "test",
-			"POSTGRES_DB":       "testdb",
-		},
-		WaitingFor: wait.ForListeningPort("5432/tcp").WithStartupTimeout(60 * time.Second),
-	}
-
-	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: req,
-		Started:          true,
-	})
+	cfg.Patterns = []string{"./testdata/sample"}
+	findings, err := Run(context.Background(), cfg)
 	if err != nil {
-		t.Fatalf("failed to start postgres container: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-
-	host, err := container.Host(ctx)
-	if err != nil {
-		t.Fatalf("failed to get container host: %v", err)
+	results := make([]result, len(findings))
+	for i, f := range findings {
+		results[i] = result{filepath.Base(f.Pos.Filename), f.Check, f.Message}
 	}
-	port, err := container.MappedPort(ctx, "5432")
-	if err != nil {
-		t.Fatalf("failed to get mapped port: %v", err)
+	return results
+}
+
+func expect(t *testing.T, got, want []result) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got %d findings, want %d:\n%v", len(got), len(want), got)
 	}
-
-	dsn := fmt.Sprintf("postgres://test:test@%s:%s/testdb?sslmode=disable", host, port.Port())
-
-	cleanup := func() {
-		_ = container.Terminate(ctx)
+	for i := range want {
+		if got[i].file != want[i].file || got[i].check != want[i].check || !strings.Contains(got[i].text, want[i].text) {
+			t.Errorf("finding %d = %v, want %v", i, got[i], want[i])
+		}
 	}
+}
 
-	return dsn, cleanup
+var staticFindings = []result{
+	{"sample.go", pgguard.CheckMissingContext, "Query() called without context"},
+	{"sample.go", pgguard.CheckUnparameterizedQuery, "fmt.Sprintf"},
+	{"sample.go", pgguard.CheckMissingContext, "Query() called without context"},
 }
 
 func TestRun_StaticOnly(t *testing.T) {
-	cfg := pgguard.Config{
-		Patterns: []string{"./testdata/sample"},
-		Format:   "text",
-	}
+	expect(t, run(t, pgguard.Config{}), staticFindings)
+}
 
-	findings, err := Run(context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if len(findings) == 0 {
-		t.Fatal("expected findings from static analysis")
-	}
-
-	var hasUnparam bool
-	for _, f := range findings {
-		if f.Check == pgguard.CheckUnparameterizedQuery {
-			hasUnparam = true
-		}
-	}
-
-	if !hasUnparam {
-		t.Error("expected unparameterized-query finding")
-	}
+func TestRun_Tests(t *testing.T) {
+	want := append([]result{}, staticFindings...)
+	want = append(want, result{"sample_test.go", pgguard.CheckInvalidSQL, `syntax error at or near "SELEC"`})
+	expect(t, run(t, pgguard.Config{Tests: true}), want)
 }
 
 func TestRun_WithDB(t *testing.T) {
-	dsn, cleanup := setupPostgres(t)
-	defer cleanup()
+	dsn := pgtest.Database(t, "postgres:16-alpine")
+	pgtest.Exec(t, dsn,
+		`CREATE TABLE users (id serial PRIMARY KEY, name text NOT NULL, email text NOT NULL)`,
+		`INSERT INTO users (name, email) SELECT 'user' || i, 'user' || i || '@example.com' FROM generate_series(1, 120000) AS i`,
+		`CREATE TABLE orders (id serial PRIMARY KEY, user_id int NOT NULL)`,
+		`INSERT INTO orders (user_id) SELECT i % 1000 FROM generate_series(1, 110000) AS i`,
+		`ANALYZE`,
+	)
 
-	cfg := pgguard.Config{
+	want := append([]result{}, staticFindings...)
+	want = append(want,
+		result{"sample.go", pgguard.CheckMissingIndex, "sequential scan on public.users (~120k rows) filtering on email"},
+		result{"sample.go", pgguard.CheckMissingIndex, "filtering on name"},
+		result{"sample.go", pgguard.CheckInvalidSchema, `column "nme" does not exist`},
+		result{"sample.go", pgguard.CheckInvalidSchema, "table missing_table does not exist"},
+		result{"sample.go", pgguard.CheckFullTableScan, "query reads all of public.orders (~110k rows)"},
+	)
+	expect(t, run(t, pgguard.Config{DSN: dsn}), want)
+}
+
+func TestRun_UnreachableDB(t *testing.T) {
+	_, err := Run(context.Background(), pgguard.Config{
 		Patterns: []string{"./testdata/sample"},
-		DSN:      dsn,
-		Format:   "text",
-	}
-
-	findings, err := Run(context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if len(findings) == 0 {
-		t.Fatal("expected findings from analysis with DB")
+		DSN:      "postgres://nobody@127.0.0.1:1/none?sslmode=disable&connect_timeout=2",
+	})
+	if err == nil {
+		t.Fatal("expected an error when the database is unreachable")
 	}
 }

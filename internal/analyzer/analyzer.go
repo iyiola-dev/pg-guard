@@ -15,7 +15,7 @@ import (
 )
 
 func Run(ctx context.Context, cfg pgguard.Config) ([]pgguard.Finding, error) {
-	pkgs, err := loadPackages(cfg.Patterns, false)
+	pkgs, err := loadPackages(cfg.Patterns, cfg.Tests)
 	if err != nil {
 		return nil, fmt.Errorf("analyzer: load packages: %w", err)
 	}

@@ -96,4 +96,5 @@ type Config struct {
 	Patterns []string
 	DSN      string
 	Format   string
+	Tests    bool // also analyze _test.go files
 }

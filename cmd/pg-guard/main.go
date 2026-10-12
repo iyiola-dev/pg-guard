@@ -26,11 +26,13 @@ Examples:
   pg-guard ./...
   pg-guard --dsn "$PG_GUARD_DSN" ./...
   pg-guard --format json ./internal/repo/...
+  pg-guard --tests ./...
 `)
 	}
 
 	dsn := flag.String("dsn", "", "Postgres connection string for live analysis")
 	format := flag.String("format", "text", "Output format: text or json")
+	tests := flag.Bool("tests", false, "Also analyze _test.go files")
 	flag.Parse()
 
 	patterns := flag.Args()
@@ -42,6 +44,7 @@ Examples:
 		Patterns: patterns,
 		DSN:      *dsn,
 		Format:   *format,
+		Tests:    *tests,
 	}
 
 	ctx := context.Background()
