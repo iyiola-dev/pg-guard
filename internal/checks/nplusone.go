@@ -8,12 +8,13 @@ func CheckNPlusOne(queries []pgguard.ExtractedQuery) []pgguard.Finding {
 	var findings []pgguard.Finding
 
 	for _, q := range queries {
-		if !q.InLoop {
+		if !q.InLoop || q.Call != pgguard.CallQuery {
 			continue
 		}
 
 		findings = append(findings, pgguard.Finding{
 			Pos:          q.Pos,
+			TokenPos:     q.TokenPos,
 			Severity:     pgguard.SeverityWarning,
 			Check:        pgguard.CheckNPlusOne,
 			Message:      "query executed inside loop body (N+1 pattern)",
