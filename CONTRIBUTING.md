@@ -28,7 +28,15 @@ Thanks for your interest in contributing!
   ```sh
   go test ./...
   ```
-  Integration tests require Docker (uses [testcontainers-go](https://golang.testcontainers.org/)).
+  Building needs Go 1.25+ with cgo and a C compiler. Integration tests require Docker (uses [testcontainers-go](https://golang.testcontainers.org/)); `go test -short ./...` skips them.
+
+### Analyzer test cases
+
+`testdata/src` is a GOPATH-style tree shared by the analyzer tests:
+
+- `lint/...` and `dblint/` hold Go code checked by `plugin/plugin_test.go`. Each expected diagnostic is marked with a `// want` comment ([analysistest](https://pkg.go.dev/golang.org/x/tools/go/analysis/analysistest) syntax), and any diagnostic without one fails the test, so add cases for code that must *not* be reported too.
+- `extract/` holds calls whose extracted details `internal/extractor` checks, each marked with an `// @name` comment.
+- `github.com/jackc/pgx/v5/...` and `gorm.io/gorm/...` are minimal stand-ins for pgx and GORM with the same import paths and method signatures, so tests run without those modules.
 
 ## Submitting a Pull Request
 
