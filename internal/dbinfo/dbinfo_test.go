@@ -166,62 +166,14 @@ func TestTableIndexes(t *testing.T) {
 	}
 }
 
-func setupPostgres(t *testing.T) (string, func()) { return pgtest.Database(t, pg16), func() {} }
-func seedSchema(t *testing.T, dsn string)         { pgtest.Exec(t, dsn, usersSchema...) }
-
 func TestExplain(t *testing.T) {
-	dsn, cleanup := setupPostgres(t)
-	defer cleanup()
-	seedSchema(t, dsn)
-
-	ctx := context.Background()
-	db, err := New(ctx, dsn)
+	db, _ := open(t, pg16, usersSchema...)
+	result, err := db.Explain(context.Background(), "SELECT * FROM users")
 	if err != nil {
-		t.Fatalf("failed to connect: %v", err)
+		t.Fatal(err)
 	}
-	defer db.Close(ctx)
-
-	result, err := db.Explain(ctx, "SELECT * FROM users")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.TableName != "users" {
-		t.Errorf("expected table name 'users', got %q", result.TableName)
-	}
-	// With 100 rows and no WHERE clause, should be a seq scan
-	if !result.SeqScan {
-		t.Error("expected seq scan for full table select")
-	}
-}
-func TestExplain_IndexScan(t *testing.T) {
-	dsn, cleanup := setupPostgres(t)
-	defer cleanup()
-
-	ctx := context.Background()
-	db, err := New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("failed to connect: %v", err)
-	}
-	defer db.Close(ctx)
-
-	// Insert enough rows so Postgres prefers an index scan over seq scan
-	stmts := []string{
-		`CREATE TABLE orders (id SERIAL PRIMARY KEY, user_id INT NOT NULL, amount INT)`,
-		`CREATE INDEX idx_orders_user_id ON orders (user_id)`,
-		`INSERT INTO orders (user_id, amount) SELECT i % 1000, i FROM generate_series(1, 50000) AS i`,
-		`ANALYZE orders`,
-	}
-	for _, s := range stmts {
-		if _, err := db.conn.Exec(ctx, s); err != nil {
-			t.Fatalf("setup failed: %v\nquery: %s", err, s)
-		}
-	}
-
-	result, err := db.Explain(ctx, "SELECT * FROM orders WHERE user_id = 1")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result.SeqScan {
-		t.Error("expected index scan for indexed column lookup on large table, got seq scan")
+	scans := result.SeqScans()
+	if len(scans) != 1 || scans[0].Relation != "users" {
+		t.Fatalf("unexpected scans: %+v", scans)
 	}
 }

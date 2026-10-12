@@ -36,7 +36,13 @@ func Run(ctx context.Context, cfg pgguard.Config) ([]pgguard.Finding, error) {
 	findings := StaticChecks(queries)
 
 	if cfg.DSN != "" {
-		dbFindings, err := runDBChecks(ctx, cfg.DSN, queries)
+		db, err := dbinfo.New(ctx, cfg.DSN)
+		if err != nil {
+			return nil, fmt.Errorf("analyzer: db checks: %w", err)
+		}
+		defer db.Close(ctx)
+
+		dbFindings, err := NewDBChecker(db).Check(ctx, queries)
 		if err != nil {
 			return nil, fmt.Errorf("analyzer: db checks: %w", err)
 		}
@@ -84,70 +90,4 @@ func loadPackages(patterns []string, tests bool) ([]*packages.Package, error) {
 		return nil, fmt.Errorf("package errors: %v", errs)
 	}
 	return pkgs, nil
-}
-
-const largeTableThreshold = 100_000
-
-func runDBChecks(ctx context.Context, dsn string, queries []pgguard.ExtractedQuery) ([]pgguard.Finding, error) {
-	db, err := dbinfo.New(ctx, dsn)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close(ctx)
-
-	var findings []pgguard.Finding
-
-	seen := make(map[string]bool)
-	for _, q := range queries {
-		if q.SQL == "" {
-			continue
-		}
-		for _, table := range q.Tables {
-			if seen[table] {
-				continue
-			}
-			seen[table] = true
-
-			exists, err := db.TableExists(ctx, table)
-			if err != nil {
-				continue
-			}
-			if !exists {
-				findings = append(findings, pgguard.Finding{
-					Pos:      q.Pos,
-					Severity: pgguard.SeverityError,
-					Check:    pgguard.CheckInvalidSchema,
-					Message:  fmt.Sprintf("table %q does not exist", table),
-					SQL:      q.SQL,
-				})
-				continue
-			}
-
-			estimate, err := db.TableRowEstimate(ctx, table)
-			if err != nil {
-				continue
-			}
-
-			if estimate < largeTableThreshold {
-				continue
-			}
-
-			result, err := db.Explain(ctx, q.SQL)
-			if err != nil {
-				continue
-			}
-
-			if result.SeqScan {
-				findings = append(findings, pgguard.Finding{
-					Pos:      q.Pos,
-					Severity: pgguard.SeverityInfo,
-					Check:    pgguard.CheckMissingIndex,
-					Message:  fmt.Sprintf("full scan on %q (~%.1fM rows); consider adding an index", table, float64(estimate)/1e6),
-					SQL:      q.SQL,
-				})
-			}
-		}
-	}
-
-	return findings, nil
 }
