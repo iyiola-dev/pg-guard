@@ -45,13 +45,43 @@ type SeqScan struct {
 	Limited bool
 }
 
-// SeqScans returns the sequential scan at the root of the plan, if any.
+// SeqScans returns every sequential scan in the plan, including those
+// beneath sort, aggregate, join and other nodes.
 func (r *ExplainResult) SeqScans() []SeqScan {
-	p := r.Plan
-	if p == nil || p.NodeType != "Seq Scan" {
-		return nil
+	var scans []SeqScan
+	var walk func(n *PlanNode, limited bool, workers int)
+	walk = func(n *PlanNode, limited bool, workers int) {
+		if n == nil {
+			return
+		}
+		switch n.NodeType {
+		case "Seq Scan":
+			rows := n.PlanRows
+			if n.ParallelAware {
+				rows *= parallelDivisor(workers)
+			}
+			scans = append(scans, SeqScan{Schema: n.Schema, Relation: n.RelationName, Filter: n.Filter, Rows: rows, Limited: limited})
+		case "Limit":
+			limited = true
+		case "Gather", "Gather Merge":
+			workers = n.WorkersPlanned
+		case "Result", "Append", "Subquery Scan":
+			// These stream rows, so a Limit above them still stops the scan early.
+		default:
+			limited = false
+		}
+		for _, child := range n.Plans {
+			walk(child, limited, workers)
+		}
 	}
-	return []SeqScan{{Schema: p.Schema, Relation: p.RelationName, Filter: p.Filter, Rows: p.PlanRows}}
+	walk(r.Plan, false, 0)
+	return scans
+}
+
+// parallelDivisor mirrors the planner's division of a parallel scan's rows
+// between workers and the participating leader.
+func parallelDivisor(workers int) float64 {
+	return float64(workers) + max(0, 1-0.3*float64(workers))
 }
 
 // DB inspects a live database. Table names passed to its methods are SQL
