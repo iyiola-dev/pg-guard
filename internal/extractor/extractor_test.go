@@ -107,9 +107,6 @@ func TestExtract(t *testing.T) {
 			SQL: "SELECT 1", NormalizedSQL: "SELECT 1", BuildMethod: pgguard.BuildConstant}},
 	}
 	for _, tt := range tests {
-		if tt.marker == "gormwhere" || tt.marker == "gormnamed" {
-			continue
-		}
 		q := get(tt.marker, tt.funcName)
 		want := tt.want
 		if want.API == "" {
@@ -133,6 +130,10 @@ func TestExtract(t *testing.T) {
 			t.Errorf("@%s: HasContext = %v, want %v", marker, q.HasContext, want)
 		}
 	}
+	// A GORM chain on a *gorm.DB parameter may carry a context set by the caller.
+	if q := get("gormwhere", "Find"); !q.HasContext {
+		t.Error("@gormwhere Find: HasContext = false for a chain of unknown origin")
+	}
 
 	if q := get("rangebody", "QueryContext"); !q.InLoop {
 		t.Error("@rangebody: query in a range body should be InLoop")
@@ -141,4 +142,9 @@ func TestExtract(t *testing.T) {
 		t.Error("@forinit: query in a for statement's init runs once and should not be InLoop")
 	}
 
+	// Positions point at the method name, so calls in a chain differ.
+	where, find := get("gormwhere", "Where"), get("gormwhere", "Find")
+	if where.Pos.Line != find.Pos.Line || where.Pos.Column >= find.Pos.Column {
+		t.Errorf("chain positions: Where at %v, Find at %v", where.Pos, find.Pos)
+	}
 }
