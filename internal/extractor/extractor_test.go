@@ -107,7 +107,7 @@ func TestExtract(t *testing.T) {
 			SQL: "SELECT 1", NormalizedSQL: "SELECT 1", BuildMethod: pgguard.BuildConstant}},
 	}
 	for _, tt := range tests {
-		if tt.marker == "gormwhere" || tt.marker == "gormnamed" || tt.marker == "constconcat" || tt.marker == "constsprintf" || tt.marker == "assigned" || tt.marker == "escaped" || tt.marker == "backtick" {
+		if tt.marker == "gormwhere" || tt.marker == "gormnamed" || tt.marker == "constconcat" || tt.marker == "constsprintf" || tt.marker == "assigned" {
 			continue
 		}
 		q := get(tt.marker, tt.funcName)
