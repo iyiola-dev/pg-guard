@@ -119,3 +119,38 @@ func TestDBChecker_EveryQuery(t *testing.T) {
 		})
 	}
 }
+
+func TestDBChecker_ReportsDatabaseErrors(t *testing.T) {
+	checker := regressionDBChecker(t, `CREATE TABLE regression_errors (id int)`)
+	cases := []struct {
+		name, sql string
+		check     pgguard.CheckName
+		severity  pgguard.Severity
+	}{
+		{"invalid column", "SELECT missing FROM regression_errors", pgguard.CheckInvalidSchema, pgguard.SeverityError},
+		{"planning failure", "SELECT 1 / 0 FROM regression_errors", pgguard.CheckDBAnalysisFailed, pgguard.SeverityWarning},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			query := regressionQuery(tc.sql, 40)
+			findings := regressionCheck(t, checker, query)
+			if len(findings) != 1 || findings[0].Check != tc.check || findings[0].Severity != tc.severity {
+				t.Fatalf("got %+v, want %s/%s", findings, tc.check, tc.severity)
+			}
+			if findings[0].SQL != query.SQL || findings[0].Pos != query.Pos {
+				t.Errorf("finding does not identify the original query: %+v", findings[0])
+			}
+		})
+	}
+}
+
+func TestDBChecker_ReturnsConnectionErrors(t *testing.T) {
+	checker := regressionDBChecker(t)
+	if err := checker.db.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_, err := checker.Check(context.Background(), []pgguard.ExtractedQuery{regressionQuery("SELECT 1", 50)})
+	if err == nil {
+		t.Fatal("expected a connection error instead of a clean result")
+	}
+}

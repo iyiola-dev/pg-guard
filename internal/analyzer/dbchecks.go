@@ -2,6 +2,7 @@ package analyzer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -11,9 +12,19 @@ import (
 	pgguard "github.com/iyiola-dev/pg-guard"
 	"github.com/iyiola-dev/pg-guard/internal/dbinfo"
 	"github.com/iyiola-dev/pg-guard/internal/sqltext"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const largeTableThreshold = 100_000
+
+// schemaErrors are the SQLSTATE codes that mean a query refers to something
+// the database does not have.
+var schemaErrors = map[string]bool{
+	"42P01": true, // undefined_table
+	"42703": true, // undefined_column
+	"42704": true, // undefined_object
+	"3F000": true, // invalid_schema_name
+}
 
 // DBChecker checks queries against a live database. It caches table
 // metadata and plans across calls, and is safe for concurrent use.
@@ -45,8 +56,9 @@ func NewDBChecker(db *dbinfo.DB) *DBChecker {
 	}
 }
 
-// Check validates the tables each query uses and inspects its plan.
-// Queries that Postgres cannot inspect are skipped.
+// Check validates the tables each query uses and inspects its plan. Errors
+// Postgres reports for a query become findings; other errors, such as a
+// lost connection, are returned.
 func (c *DBChecker) Check(ctx context.Context, queries []pgguard.ExtractedQuery) ([]pgguard.Finding, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -98,7 +110,8 @@ func (c *DBChecker) checkQuery(ctx context.Context, q pgguard.ExtractedQuery, in
 		}
 		switch {
 		case meta.err != nil:
-			return nil, nil
+			return append(findings, finding(q, pgguard.SeverityWarning, pgguard.CheckDBAnalysisFailed,
+				fmt.Sprintf("could not look up table %s: %s", t, pgMessage(meta.err)), "")), nil
 		case !meta.exists:
 			findings = append(findings, finding(q, pgguard.SeverityError, pgguard.CheckInvalidSchema,
 				fmt.Sprintf("table %s does not exist", t), ""))
@@ -113,7 +126,7 @@ func (c *DBChecker) checkQuery(ctx context.Context, q pgguard.ExtractedQuery, in
 		return nil, err
 	}
 	if plan.err != nil {
-		return nil, nil
+		return []pgguard.Finding{planFailure(q, plan.err)}, nil
 	}
 
 	type scanKey struct {
@@ -159,6 +172,9 @@ func (c *DBChecker) table(ctx context.Context, t sqltext.Table) (*tableMeta, err
 		meta.indexes, err = c.db.TableIndexes(ctx, name)
 	}
 	if err != nil {
+		if !isQueryError(err) {
+			return nil, err
+		}
 		meta.err = err
 	}
 	c.tables[name] = meta
@@ -170,6 +186,9 @@ func (c *DBChecker) plan(ctx context.Context, sql string) (*planOutcome, error) 
 		return p, nil
 	}
 	result, err := c.db.Explain(ctx, sql)
+	if err != nil && !isQueryError(err) {
+		return nil, err
+	}
 	p := &planOutcome{result: result, err: err}
 	c.plans[sql] = p
 	return p, nil
@@ -203,6 +222,31 @@ func scanFinding(q pgguard.ExtractedQuery, t sqltext.Table, scan dbinfo.SeqScan,
 	return finding(q, pgguard.SeverityInfo, pgguard.CheckMissingIndex,
 		fmt.Sprintf("sequential scan on %s (~%s rows) filtering on %s; consider an index", t, size, list),
 		fmt.Sprintf("Consider an index on %s (%s)", t, list)), true
+}
+
+func planFailure(q pgguard.ExtractedQuery, err error) pgguard.Finding {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && schemaErrors[pgErr.Code] {
+		return finding(q, pgguard.SeverityError, pgguard.CheckInvalidSchema, pgErr.Message, "")
+	}
+	return finding(q, pgguard.SeverityWarning, pgguard.CheckDBAnalysisFailed,
+		"could not plan query: "+pgMessage(err), "")
+}
+
+// isQueryError reports whether Postgres rejected a statement, as opposed to
+// the connection failing.
+func isQueryError(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr)
+}
+
+// pgMessage describes an error Postgres reported, without wrapping text.
+func pgMessage(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return fmt.Sprintf("%s (SQLSTATE %s)", pgErr.Message, pgErr.Code)
+	}
+	return err.Error()
 }
 
 func finding(q pgguard.ExtractedQuery, sev pgguard.Severity, check pgguard.CheckName, msg, fix string) pgguard.Finding {
