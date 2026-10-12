@@ -52,12 +52,12 @@ func (db *DB) TableIndexes(ctx context.Context, table string) ([]IndexInfo, erro
 	rows, err := db.conn.Query(ctx, `
 		SELECT i.relname, ix.indisunique, array_agg(a.attname ORDER BY k.n)
 		FROM pg_index ix
-		JOIN pg_class t ON t.oid = ix.indrelid
 		JOIN pg_class i ON i.oid = ix.indexrelid
 		JOIN unnest(ix.indkey) WITH ORDINALITY AS k(attnum, n) ON true
-		JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
-		WHERE t.relname = $1
+		JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.attnum
+		WHERE ix.indrelid = to_regclass($1)
 		GROUP BY i.relname, ix.indisunique
+		ORDER BY i.relname
 	`, table)
 	if err != nil {
 		return nil, fmt.Errorf("dbinfo: indexes for %q: %w", table, err)
@@ -78,9 +78,7 @@ func (db *DB) TableIndexes(ctx context.Context, table string) ([]IndexInfo, erro
 
 func (db *DB) TableExists(ctx context.Context, table string) (bool, error) {
 	var exists bool
-	err := db.conn.QueryRow(ctx,
-		"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = $1)", table,
-	).Scan(&exists)
+	err := db.conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", table).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("dbinfo: table exists %q: %w", table, err)
 	}
@@ -89,10 +87,12 @@ func (db *DB) TableExists(ctx context.Context, table string) (bool, error) {
 
 func (db *DB) ColumnExists(ctx context.Context, table, column string) (bool, error) {
 	var exists bool
-	err := db.conn.QueryRow(ctx,
-		"SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = $2)",
-		table, column,
-	).Scan(&exists)
+	err := db.conn.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM pg_attribute
+			WHERE attrelid = to_regclass($1) AND attname = $2 AND attnum > 0 AND NOT attisdropped
+		)
+	`, table, column).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("dbinfo: column exists %q.%q: %w", table, column, err)
 	}
