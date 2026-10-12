@@ -1,10 +1,11 @@
 package extractor
 
 import (
+	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
-	"strconv"
 
 	pgguard "github.com/iyiola-dev/pg-guard"
 	"github.com/iyiola-dev/pg-guard/internal/sqltext"
@@ -69,8 +70,10 @@ var pgxMethods = map[string]method{
 // package described by info.
 func Extract(fset *token.FileSet, files []*ast.File, info *types.Info) []pgguard.ExtractedQuery {
 	x := &extractor{
-		fset: fset,
-		info: info,
+		fset:     fset,
+		info:     info,
+		assigns:  indexAssignments(files, info),
+		visiting: make(map[*types.Var]bool),
 	}
 	for _, file := range files {
 		var stack []ast.Node
@@ -90,9 +93,11 @@ func Extract(fset *token.FileSet, files []*ast.File, info *types.Info) []pgguard
 }
 
 type extractor struct {
-	fset    *token.FileSet
-	info    *types.Info
-	queries []pgguard.ExtractedQuery
+	fset     *token.FileSet
+	info     *types.Info
+	assigns  map[*types.Var]*assignments
+	visiting map[*types.Var]bool
+	queries  []pgguard.ExtractedQuery
 }
 
 func (x *extractor) call(call *ast.CallExpr, stack []ast.Node) {
@@ -207,14 +212,13 @@ func (x *extractor) eval(e ast.Expr, depth int) value {
 	if depth > maxDepth {
 		return unknown
 	}
-	switch e := ast.Unparen(e).(type) {
-	case *ast.BasicLit:
-		if e.Kind == token.STRING {
-			text, err := strconv.Unquote(e.Value)
-			if err == nil {
-				return value{text: text, method: pgguard.BuildConstant, exact: true}
-			}
-		}
+	e = ast.Unparen(e)
+	if tv, ok := x.info.Types[e]; ok && tv.Value != nil && tv.Value.Kind() == constant.String {
+		return value{text: constant.StringVal(tv.Value), method: pgguard.BuildConstant, exact: true}
+	}
+	switch e := e.(type) {
+	case *ast.Ident:
+		return x.evalVar(e, depth)
 	case *ast.BinaryExpr:
 		if e.Op == token.ADD {
 			return x.evalConcat(e, depth)
@@ -227,8 +231,51 @@ func (x *extractor) eval(e ast.Expr, depth int) value {
 	return unknown
 }
 
+// evalVar follows a local or package variable to the values assigned to it.
+func (x *extractor) evalVar(id *ast.Ident, depth int) value {
+	v, ok := x.info.Uses[id].(*types.Var)
+	if !ok || v.IsField() || x.visiting[v] {
+		return unknown
+	}
+	as := x.assigns[v]
+	if as == nil || as.escaped || len(as.values) == 0 {
+		return unknown
+	}
+	x.visiting[v] = true
+	defer delete(x.visiting, v)
+
+	if a := as.values[0]; len(as.values) == 1 && !a.append && !a.tuple {
+		return x.eval(a.expr, depth+1)
+	}
+
+	// The text depends on control flow, but the build method can still be
+	// told: SQL appended from non-constant values is dynamic.
+	result := value{method: pgguard.BuildConstant}
+	for _, a := range as.values {
+		if a.tuple {
+			result.method = pgguard.BuildUnknown
+			continue
+		}
+		switch v := x.eval(a.expr, depth+1); {
+		case v.method == pgguard.BuildSprintf || v.method == pgguard.BuildConcat:
+			return value{method: v.method}
+		case v.method == pgguard.BuildUnknown && a.append:
+			return value{method: pgguard.BuildConcat}
+		case v.method == pgguard.BuildUnknown:
+			result.method = pgguard.BuildUnknown
+		}
+	}
+	return result
+}
+
 func (x *extractor) evalConcat(e *ast.BinaryExpr, depth int) value {
 	l, r := x.eval(e.X, depth+1), x.eval(e.Y, depth+1)
+	switch {
+	case l.exact && r.exact:
+		return value{text: l.text + r.text, method: pgguard.BuildConstant, exact: true}
+	case l.method == pgguard.BuildConstant && r.method == pgguard.BuildConstant:
+		return value{method: pgguard.BuildConstant}
+	}
 	return value{text: template(e.X, l) + template(e.Y, r), method: pgguard.BuildConcat}
 }
 
@@ -240,12 +287,52 @@ func template(e ast.Expr, v value) string {
 	return "{" + types.ExprString(e) + "}"
 }
 
+// evalSprintf evaluates fmt.Sprintf calls whose arguments are all known,
+// and otherwise reports the format string as a template.
 func (x *extractor) evalSprintf(call *ast.CallExpr, depth int) value {
-	v := value{method: pgguard.BuildSprintf}
-	if len(call.Args) > 0 {
-		v.text = x.eval(call.Args[0], depth+1).text
+	dynamic := value{method: pgguard.BuildSprintf}
+	if len(call.Args) == 0 || call.Ellipsis.IsValid() {
+		return dynamic
 	}
-	return v
+	format := x.eval(call.Args[0], depth+1)
+	dynamic.text = format.text
+	if !format.exact {
+		return dynamic
+	}
+	args := make([]any, 0, len(call.Args)-1)
+	for _, a := range call.Args[1:] {
+		v, ok := x.constArg(a, depth+1)
+		if !ok {
+			return dynamic
+		}
+		args = append(args, v)
+	}
+	return value{text: fmt.Sprintf(format.text, args...), method: pgguard.BuildConstant, exact: true}
+}
+
+// constArg returns a Sprintf argument whose value is known at compile time.
+func (x *extractor) constArg(e ast.Expr, depth int) (any, bool) {
+	tv := x.info.Types[ast.Unparen(e)]
+	if tv.Type == nil || types.NewMethodSet(tv.Type).Len() > 0 {
+		return nil, false // fmt might call a String or Error method
+	}
+	if tv.Value != nil {
+		switch tv.Value.Kind() {
+		case constant.String:
+			return constant.StringVal(tv.Value), true
+		case constant.Bool:
+			return constant.BoolVal(tv.Value), true
+		case constant.Int:
+			return constant.Int64Val(tv.Value)
+		}
+		return nil, false
+	}
+	if isString(tv.Type) {
+		if v := x.eval(e, depth); v.exact {
+			return v.text, true
+		}
+	}
+	return nil, false
 }
 
 func (x *extractor) isFunc(call *ast.CallExpr, pkg, name string) bool {
@@ -277,6 +364,99 @@ func inLoop(stack []ast.Node) bool {
 		}
 	}
 	return false
+}
+
+// assignment is a value stored in a variable.
+type assignment struct {
+	expr   ast.Expr
+	append bool // +=
+	tuple  bool // one result of a multi-value expression, or a range variable
+}
+
+type assignments struct {
+	values  []assignment
+	escaped bool // the variable's address is taken
+}
+
+// indexAssignments records the values assigned to each variable in files.
+// Declarations without a value are skipped: an empty string is not SQL.
+func indexAssignments(files []*ast.File, info *types.Info) map[*types.Var]*assignments {
+	index := make(map[*types.Var]*assignments)
+	get := func(e ast.Expr) *assignments {
+		v := varOf(info, e)
+		if v == nil {
+			return nil
+		}
+		as := index[v]
+		if as == nil {
+			as = &assignments{}
+			index[v] = as
+		}
+		return as
+	}
+	add := func(e ast.Expr, a assignment) {
+		if as := get(e); as != nil {
+			as.values = append(as.values, a)
+		}
+	}
+
+	for _, file := range files {
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch n := n.(type) {
+			case *ast.AssignStmt:
+				switch {
+				case n.Tok == token.ADD_ASSIGN:
+					add(n.Lhs[0], assignment{expr: n.Rhs[0], append: true})
+				case n.Tok != token.ASSIGN && n.Tok != token.DEFINE:
+				case len(n.Lhs) == len(n.Rhs):
+					for i, lhs := range n.Lhs {
+						add(lhs, assignment{expr: n.Rhs[i]})
+					}
+				default:
+					for _, lhs := range n.Lhs {
+						add(lhs, assignment{expr: n.Rhs[0], tuple: true})
+					}
+				}
+			case *ast.ValueSpec:
+				switch {
+				case len(n.Values) == len(n.Names):
+					for i, name := range n.Names {
+						add(name, assignment{expr: n.Values[i]})
+					}
+				case len(n.Values) == 1:
+					for _, name := range n.Names {
+						add(name, assignment{expr: n.Values[0], tuple: true})
+					}
+				}
+			case *ast.RangeStmt:
+				for _, e := range []ast.Expr{n.Key, n.Value} {
+					if e != nil {
+						add(e, assignment{tuple: true})
+					}
+				}
+			case *ast.UnaryExpr:
+				if n.Op == token.AND {
+					if as := get(n.X); as != nil {
+						as.escaped = true
+					}
+				}
+			}
+			return true
+		})
+	}
+	return index
+}
+
+func varOf(info *types.Info, e ast.Expr) *types.Var {
+	id, ok := ast.Unparen(e).(*ast.Ident)
+	if !ok || id.Name == "_" {
+		return nil
+	}
+	if v, ok := info.Defs[id].(*types.Var); ok {
+		return v
+	}
+	v, _ := info.Uses[id].(*types.Var)
+	return v
 }
 
 // matches reports whether sig takes a context and an SQL string where m
