@@ -81,3 +81,41 @@ func TestDBChecker_NestedScan(t *testing.T) {
 		t.Errorf("finding does not identify the original call site: %+v", finding)
 	}
 }
+
+func TestDBChecker_EveryQuery(t *testing.T) {
+	checker := regressionDBChecker(t,
+		`CREATE TABLE regression_every_query (id int PRIMARY KEY, payload text NOT NULL)`,
+		`INSERT INTO regression_every_query SELECT i, 'row-' || i FROM generate_series(1, 120000) AS i`,
+		`ANALYZE regression_every_query`,
+	)
+	indexed := regressionQuery("SELECT payload FROM regression_every_query WHERE id = 1", 10)
+	scan := regressionQuery("SELECT payload FROM regression_every_query", 20)
+	sameSQLAtAnotherSite := regressionQuery(scan.SQL, 30)
+
+	cases := []struct {
+		name    string
+		queries []pgguard.ExtractedQuery
+		want    []pgguard.ExtractedQuery
+	}{
+		{"indexed first", []pgguard.ExtractedQuery{indexed, scan}, []pgguard.ExtractedQuery{scan}},
+		{"scan first", []pgguard.ExtractedQuery{scan, indexed}, []pgguard.ExtractedQuery{scan}},
+		{"same SQL at separate call sites", []pgguard.ExtractedQuery{indexed, scan, sameSQLAtAnotherSite}, []pgguard.ExtractedQuery{scan, sameSQLAtAnotherSite}},
+		{"repeat checks retain call sites", []pgguard.ExtractedQuery{sameSQLAtAnotherSite, indexed, scan}, []pgguard.ExtractedQuery{sameSQLAtAnotherSite, scan}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			findings := regressionCheck(t, checker, tc.queries...)
+			if len(findings) != len(tc.want) {
+				t.Fatalf("got %d findings, want %d: %+v", len(findings), len(tc.want), findings)
+			}
+			for i, finding := range findings {
+				if finding.Check != pgguard.CheckFullTableScan || finding.Severity != pgguard.SeverityInfo {
+					t.Errorf("finding %d = %s/%s, want full-table-scan/info", i, finding.Check, finding.Severity)
+				}
+				if finding.Pos != tc.want[i].Pos || finding.SQL != tc.want[i].SQL {
+					t.Errorf("finding %d does not identify the expected call site: got %+v, want %+v", i, finding, tc.want[i])
+				}
+			}
+		})
+	}
+}

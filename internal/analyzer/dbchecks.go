@@ -16,12 +16,13 @@ import (
 const largeTableThreshold = 100_000
 
 // DBChecker checks queries against a live database. It caches table
-// metadata across calls, and is safe for concurrent use.
+// metadata and plans across calls, and is safe for concurrent use.
 type DBChecker struct {
 	db *dbinfo.DB
 
 	mu     sync.Mutex
 	tables map[string]*tableMeta
+	plans  map[string]*planOutcome
 }
 
 type tableMeta struct {
@@ -40,6 +41,7 @@ func NewDBChecker(db *dbinfo.DB) *DBChecker {
 	return &DBChecker{
 		db:     db,
 		tables: make(map[string]*tableMeta),
+		plans:  make(map[string]*planOutcome),
 	}
 }
 
@@ -74,20 +76,8 @@ func (c *DBChecker) Check(ctx context.Context, queries []pgguard.ExtractedQuery)
 	}
 
 	var findings []pgguard.Finding
-	seenTables := make(map[sqltext.Table]bool)
 	for _, cand := range candidates {
 		if slices.ContainsFunc(cand.info.Tables, func(t sqltext.Table) bool { return created[t.Name] }) {
-			continue
-		}
-		// Check only the first query referring to each table.
-		unseen := len(cand.info.Tables) == 0
-		for _, table := range cand.info.Tables {
-			if !seenTables[table] {
-				unseen = true
-			}
-			seenTables[table] = true
-		}
-		if !unseen {
 			continue
 		}
 		fs, err := c.checkQuery(ctx, cand.q, cand.info)
@@ -176,8 +166,13 @@ func (c *DBChecker) table(ctx context.Context, t sqltext.Table) (*tableMeta, err
 }
 
 func (c *DBChecker) plan(ctx context.Context, sql string) (*planOutcome, error) {
+	if p, ok := c.plans[sql]; ok {
+		return p, nil
+	}
 	result, err := c.db.Explain(ctx, sql)
-	return &planOutcome{result: result, err: err}, nil
+	p := &planOutcome{result: result, err: err}
+	c.plans[sql] = p
+	return p, nil
 }
 
 func scanFinding(q pgguard.ExtractedQuery, t sqltext.Table, scan dbinfo.SeqScan, meta *tableMeta) (pgguard.Finding, bool) {
