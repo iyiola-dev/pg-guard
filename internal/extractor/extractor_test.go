@@ -89,3 +89,53 @@ func TestExtract_Basic(t *testing.T) {
 		t.Error("did not find loop query")
 	}
 }
+
+func TestExtract_ReceiverAndSQLArgument(t *testing.T) {
+	queries := Extract(loadTestPackages(t, testdataDir("receivers")))
+
+	type expected struct {
+		method     string
+		hasContext bool
+	}
+	want := map[string]expected{
+		"SELECT 'db-query'":                        {"Query", false},
+		"SELECT 'db-exec'":                         {"Exec", false},
+		"SELECT 'db-query-row'":                    {"QueryRow", false},
+		"SELECT 'db-query-context'":                {"QueryContext", true},
+		"SELECT 'db-exec-context'":                 {"ExecContext", true},
+		"SELECT 'db-query-row-context'":            {"QueryRowContext", true},
+		"SELECT 'tx-query'":                        {"Query", false},
+		"SELECT 'tx-exec-context'":                 {"ExecContext", true},
+		"SELECT 'conn-query-context'":              {"QueryContext", true},
+		"SELECT 'pgx-query'":                       {"Query", true},
+		"SELECT 'pgx-exec'":                        {"Exec", true},
+		"SELECT 'pgx-query-row'":                   {"QueryRow", true},
+		"SELECT 'pgx-tx-query'":                    {"Query", true},
+		"SELECT 'embedded-query'":                  {"Query", false},
+		"SELECT 'method-expression-query'":         {"Query", false},
+		"SELECT 'method-expression-query-context'": {"QueryContext", true},
+	}
+	if len(queries) != len(want) {
+		t.Fatalf("got %d SQL calls, want %d: %+v", len(queries), len(want), queries)
+	}
+	seen := make(map[string]bool)
+	for _, query := range queries {
+		expectation, ok := want[query.SQL]
+		if !ok {
+			t.Errorf("unexpected SQL %q from %s; unrelated methods and Stmt values must be ignored", query.SQL, query.FuncName)
+			continue
+		}
+		if seen[query.SQL] {
+			t.Errorf("duplicate extraction of %q", query.SQL)
+		}
+		seen[query.SQL] = true
+		if query.FuncName != expectation.method || query.HasContext != expectation.hasContext || query.BuildMethod != "literal" {
+			t.Errorf("%q: got method=%s context=%v build=%s, want method=%s context=%v build=literal", query.SQL, query.FuncName, query.HasContext, query.BuildMethod, expectation.method, expectation.hasContext)
+		}
+	}
+	for sql := range want {
+		if !seen[sql] {
+			t.Errorf("missing SQL call %q", sql)
+		}
+	}
+}
