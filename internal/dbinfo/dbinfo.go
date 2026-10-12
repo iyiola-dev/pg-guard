@@ -3,8 +3,11 @@ package dbinfo
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 
+	"github.com/iyiola-dev/pg-guard/internal/sqltext"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -88,7 +91,8 @@ func parallelDivisor(workers int) float64 {
 // names, optionally schema-qualified and quoted, resolved through the search
 // path. It is not safe for concurrent use.
 type DB struct {
-	conn *pgx.Conn
+	conn    *pgx.Conn
+	version int // server_version_num
 }
 
 func New(ctx context.Context, dsn string) (*DB, error) {
@@ -96,7 +100,12 @@ func New(ctx context.Context, dsn string) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dbinfo: connect: %w", err)
 	}
-	return &DB{conn: conn}, nil
+	var version int
+	if err := conn.QueryRow(ctx, "SELECT current_setting('server_version_num')::int").Scan(&version); err != nil {
+		conn.Close(ctx)
+		return nil, fmt.Errorf("dbinfo: server version: %w", err)
+	}
+	return &DB{conn: conn, version: version}, nil
 }
 
 func (db *DB) Close(ctx context.Context) error {
@@ -175,10 +184,40 @@ func (db *DB) ColumnExists(ctx context.Context, table, column string) (bool, err
 	return exists, nil
 }
 
-// Explain returns the root plan for query without running the statement.
+// Explain returns the plan for a single SELECT, INSERT, UPDATE, DELETE or
+// MERGE statement without running it. $N placeholders get a generic plan:
+// EXPLAIN (GENERIC_PLAN) on Postgres 16 and later, and a prepared statement
+// with plan_cache_mode = force_generic_plan before that. Everything happens
+// in a read-only transaction that is rolled back.
 func (db *DB) Explain(ctx context.Context, query string) (*ExplainResult, error) {
+	info, err := sqltext.Inspect(query)
+	if err != nil {
+		return nil, fmt.Errorf("dbinfo: explain: %w", err)
+	}
+	if info.Statements != 1 || info.Command == "" {
+		return nil, errors.New("dbinfo: explain: only a single SELECT, INSERT, UPDATE, DELETE or MERGE statement can be explained")
+	}
+
+	tx, err := db.conn.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, fmt.Errorf("dbinfo: explain: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = '30s'; SET LOCAL lock_timeout = '5s'"); err != nil {
+		return nil, fmt.Errorf("dbinfo: explain: %w", err)
+	}
+
 	var planJSON []byte
-	if err := db.conn.QueryRow(ctx, "EXPLAIN (FORMAT JSON, VERBOSE) "+query).Scan(&planJSON); err != nil {
+	switch {
+	case info.Params == 0:
+		planJSON, err = queryText(ctx, tx, "EXPLAIN (FORMAT JSON, VERBOSE) "+query)
+	case db.version >= 160000:
+		planJSON, err = queryText(ctx, tx, "EXPLAIN (FORMAT JSON, VERBOSE, GENERIC_PLAN) "+query)
+	default:
+		planJSON, err = explainPrepared(ctx, tx, query, info.Params)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("dbinfo: explain: %w", err)
 	}
 
@@ -192,4 +231,45 @@ func (db *DB) Explain(ctx context.Context, query string) (*ExplainResult, error)
 		return &ExplainResult{}, nil
 	}
 	return &ExplainResult{Plan: plans[0].Plan}, nil
+}
+
+// explainPrepared plans query generically on servers without GENERIC_PLAN.
+// Prepared statements outlive transactions, so the statement is always
+// deallocated, recovering the transaction first if EXPLAIN fails.
+func explainPrepared(ctx context.Context, tx pgx.Tx, query string, params int) ([]byte, error) {
+	if _, err := tx.Exec(ctx, "SET LOCAL plan_cache_mode = force_generic_plan"); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Conn().PgConn().Exec(ctx, "PREPARE pgguard_explain AS "+query).ReadAll(); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, "SAVEPOINT pgguard_explain"); err != nil {
+		return nil, err
+	}
+
+	args := strings.TrimSuffix(strings.Repeat("NULL, ", params), ", ")
+	plan, explainErr := queryText(ctx, tx, "EXPLAIN (FORMAT JSON, VERBOSE) EXECUTE pgguard_explain("+args+")")
+	if explainErr != nil {
+		if _, err := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT pgguard_explain"); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := tx.Exec(ctx, "DEALLOCATE pgguard_explain"); err != nil {
+		return nil, err
+	}
+	return plan, explainErr
+}
+
+// queryText runs a statement returning one text value over the simple
+// query protocol, so that Postgres reads $N placeholders as part of the
+// statement instead of expecting bound arguments.
+func queryText(ctx context.Context, tx pgx.Tx, sql string) ([]byte, error) {
+	results, err := tx.Conn().PgConn().Exec(ctx, sql).ReadAll()
+	if err != nil {
+		return nil, err
+	}
+	if len(results) != 1 || len(results[0].Rows) == 0 || len(results[0].Rows[0]) == 0 {
+		return nil, errors.New("unexpected EXPLAIN output")
+	}
+	return results[0].Rows[0][0], nil
 }

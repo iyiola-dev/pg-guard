@@ -2,11 +2,14 @@ package dbinfo
 
 import (
 	"context"
+	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/iyiola-dev/pg-guard/internal/pgtest"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const (
@@ -167,13 +170,155 @@ func TestTableIndexes(t *testing.T) {
 }
 
 func TestExplain(t *testing.T) {
+	for _, image := range []string{pg16, pg15} {
+		t.Run(image, func(t *testing.T) {
+			db, _ := open(t, image, plannerSchema...)
+			testExplain(t, db)
+		})
+	}
+}
+
+func testExplain(t *testing.T, db *DB) {
+	type scan struct {
+		filtered, limited bool
+	}
+	tests := []struct {
+		name string
+		sql  string
+		want map[string]scan // by relation
+	}{
+		{
+			name: "beneath sort",
+			sql:  "SELECT id FROM users WHERE name = $1 ORDER BY email",
+			want: map[string]scan{"users": {filtered: true}},
+		},
+		{
+			name: "beneath aggregate",
+			sql:  "SELECT user_id, sum(amount) FROM orders GROUP BY user_id",
+			want: map[string]scan{"orders": {}},
+		},
+		{
+			name: "beneath join",
+			sql:  "SELECT o.id FROM orders o JOIN users u ON u.id = o.user_id WHERE u.name = $1",
+			want: map[string]scan{"orders": {}, "users": {filtered: true}},
+		},
+		{
+			name: "beneath limit",
+			sql:  "SELECT * FROM users LIMIT 5",
+			want: map[string]scan{"users": {limited: true}},
+		},
+		{
+			name: "index scan",
+			sql:  "SELECT name FROM users WHERE id = $1",
+			want: map[string]scan{},
+		},
+		{
+			name: "parameterized insert",
+			sql:  "INSERT INTO orders (id, user_id, amount) VALUES ($1, $2, $3)",
+			want: map[string]scan{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := db.Explain(context.Background(), tt.sql)
+			if err != nil {
+				t.Fatalf("Explain: %v", err)
+			}
+			got := make(map[string]scan)
+			for _, s := range result.SeqScans() {
+				if s.Schema != "public" {
+					t.Errorf("scan of %s: schema = %q, want public", s.Relation, s.Schema)
+				}
+				got[s.Relation] = scan{filtered: s.Filter != "", limited: s.Limited}
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("seq scans = %+v, want %+v", got, tt.want)
+			}
+			for rel, want := range tt.want {
+				if got[rel] != want {
+					t.Errorf("scan of %s = %+v, want %+v", rel, got[rel], want)
+				}
+			}
+		})
+	}
+
+	// Failures are Postgres errors, and leave the connection usable.
+	failing := []string{
+		"SELECT id FROM users WHERE no_such_fn($1)", // fails to prepare
+		"SELECT id FROM users WHERE id = $1 + 1/0",  // fails while planning
+		"SELECT nme FROM users",
+	}
+	for _, sql := range failing {
+		_, err := db.Explain(context.Background(), sql)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) {
+			t.Errorf("Explain(%q) = %v, want a Postgres error", sql, err)
+		}
+		if _, err := db.Explain(context.Background(), "SELECT name FROM users WHERE id = $1"); err != nil {
+			t.Fatalf("Explain after %q failed: %v", sql, err)
+		}
+	}
+}
+
+func TestExplain_RejectsOtherStatements(t *testing.T) {
 	db, _ := open(t, pg16, usersSchema...)
-	result, err := db.Explain(context.Background(), "SELECT * FROM users")
+	ctx := context.Background()
+
+	for _, sql := range []string{
+		"SELECT 1; DROP TABLE users",
+		"DROP TABLE users",
+		"CREATE TABLE copy AS SELECT * FROM users",
+		"SELEC 1",
+	} {
+		if _, err := db.Explain(ctx, sql); err == nil {
+			t.Errorf("Explain(%q) succeeded, want an error", sql)
+		}
+	}
+	if exists, err := db.TableExists(ctx, "users"); err != nil || !exists {
+		t.Fatalf("users table is gone (exists=%v, err=%v)", exists, err)
+	}
+}
+
+func TestExplain_DoesNotWrite(t *testing.T) {
+	db, _ := open(t, pg16, usersSchema...)
+	ctx := context.Background()
+
+	for _, sql := range []string{
+		"INSERT INTO users (name, email) VALUES ($1, $2)",
+		"UPDATE users SET name = 'changed'",
+		"DELETE FROM users",
+	} {
+		if _, err := db.Explain(ctx, sql); err != nil {
+			t.Fatalf("Explain(%q): %v", sql, err)
+		}
+	}
+
+	var count, changed int
+	err := db.conn.QueryRow(ctx, "SELECT count(*), count(*) FILTER (WHERE name = 'changed') FROM users").Scan(&count, &changed)
 	if err != nil {
 		t.Fatal(err)
 	}
-	scans := result.SeqScans()
-	if len(scans) != 1 || scans[0].Relation != "users" {
-		t.Fatalf("unexpected scans: %+v", scans)
+	if count != 100 || changed != 0 {
+		t.Errorf("users has %d rows, %d changed; EXPLAIN must not modify data", count, changed)
+	}
+}
+
+func TestExplain_ParameterizedUsesIndex(t *testing.T) {
+	db, _ := open(t, pg16,
+		`CREATE TABLE orders (id SERIAL PRIMARY KEY, user_id INT NOT NULL, amount INT)`,
+		`CREATE INDEX idx_orders_user_id ON orders (user_id)`,
+		`INSERT INTO orders (user_id, amount) SELECT i % 1000, i FROM generate_series(1, 50000) AS i`,
+		`ANALYZE orders`,
+	)
+
+	result, err := db.Explain(context.Background(), "SELECT * FROM orders WHERE user_id = $1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if scans := result.SeqScans(); len(scans) != 0 {
+		t.Errorf("expected an index scan for an indexed lookup, got seq scans %+v", scans)
+	}
+	if !strings.Contains(result.Plan.NodeType, "Index") && !strings.Contains(result.Plan.NodeType, "Bitmap") {
+		t.Errorf("top plan node = %q, want an index or bitmap scan", result.Plan.NodeType)
 	}
 }
