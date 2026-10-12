@@ -1,141 +1,144 @@
 package extractor
 
 import (
+	"bufio"
+	"os"
 	"path/filepath"
-	"runtime"
+	"regexp"
 	"testing"
 
+	pgguard "github.com/iyiola-dev/pg-guard"
 	"golang.org/x/tools/go/packages"
 )
 
-func loadTestPackages(t *testing.T, dir string) []*packages.Package {
+// loadMarked extracts the queries of testdata/src/extract and indexes them
+// by the @name marker on their line.
+func loadMarked(t *testing.T) map[string][]pgguard.ExtractedQuery {
 	t.Helper()
+	gopath, err := filepath.Abs(filepath.Join("..", "..", "testdata"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg := &packages.Config{
 		Mode: packages.NeedSyntax | packages.NeedFiles | packages.NeedName | packages.NeedTypes | packages.NeedTypesInfo,
-		Dir:  dir,
+		Dir:  gopath,
+		Env:  append(os.Environ(), "GOPATH="+gopath, "GO111MODULE=off", "GOWORK=off", "GOFLAGS="),
 	}
-	pkgs, err := packages.Load(cfg, ".")
+	pkgs, err := packages.Load(cfg, "extract")
 	if err != nil {
-		t.Fatalf("failed to load packages: %v", err)
+		t.Fatalf("load: %v", err)
 	}
-	if len(pkgs) == 0 {
-		t.Fatal("no packages loaded")
+	if len(pkgs) != 1 || len(pkgs[0].Errors) > 0 {
+		t.Fatalf("load: %v", pkgs)
 	}
-	for _, pkg := range pkgs {
-		if len(pkg.Errors) > 0 {
-			t.Fatalf("package errors: %v", pkg.Errors)
-		}
+	pkg := pkgs[0]
+
+	markers := make(map[int]string)
+	marker := regexp.MustCompile(`// @(\w+)`)
+	f, err := os.Open(pkg.GoFiles[0])
+	if err != nil {
+		t.Fatal(err)
 	}
-	return pkgs
-}
-
-func testdataDir(sub string) string {
-	_, file, _, _ := runtime.Caller(0)
-	return filepath.Join(filepath.Dir(file), "testdata", sub)
-}
-
-func TestExtract_Basic(t *testing.T) {
-	pkgs := loadTestPackages(t, testdataDir("basic"))
-	queries := Extract(pkgs)
-
-	if len(queries) == 0 {
-		t.Fatal("expected queries to be extracted, got 0")
-	}
-
-	var foundLiteral, foundSprintf, foundConcat, foundContext, foundLoop bool
-	for _, q := range queries {
-		t.Logf("func=%s build=%s param=%v ctx=%v loop=%v sql=%q",
-			q.FuncName, q.BuildMethod, q.Parameterized, q.HasContext, q.InLoop, q.SQL)
-
-		switch {
-		case q.FuncName == "Query" && q.BuildMethod == "literal" && !q.InLoop:
-			foundLiteral = true
-			if !q.Parameterized {
-				t.Error("literal query with $1 should be marked parameterized")
-			}
-		case q.FuncName == "Query" && q.BuildMethod == "sprintf":
-			foundSprintf = true
-			if q.Parameterized {
-				t.Error("sprintf query should not be marked parameterized")
-			}
-		case q.FuncName == "Query" && q.BuildMethod == "concat":
-			foundConcat = true
-			if q.Parameterized {
-				t.Error("concat query should not be marked parameterized")
-			}
-		case q.FuncName == "QueryContext":
-			foundContext = true
-			if !q.HasContext {
-				t.Error("QueryContext should have HasContext=true")
-			}
-		case q.FuncName == "Query" && q.InLoop:
-			foundLoop = true
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for line := 1; scanner.Scan(); line++ {
+		if m := marker.FindStringSubmatch(scanner.Text()); m != nil {
+			markers[line] = m[1]
 		}
 	}
 
-	if !foundLiteral {
-		t.Error("did not find literal query")
+	byMarker := make(map[string][]pgguard.ExtractedQuery)
+	for _, q := range Extract(pkg.Fset, pkg.Syntax, pkg.TypesInfo) {
+		if name, ok := markers[q.Pos.Line]; ok {
+			byMarker[name] = append(byMarker[name], q)
+		}
 	}
-	if !foundSprintf {
-		t.Error("did not find sprintf query")
-	}
-	if !foundConcat {
-		t.Error("did not find concat query")
-	}
-	if !foundContext {
-		t.Error("did not find context query")
-	}
-	if !foundLoop {
-		t.Error("did not find loop query")
-	}
+	return byMarker
 }
 
-func TestExtract_ReceiverAndSQLArgument(t *testing.T) {
-	queries := Extract(loadTestPackages(t, testdataDir("receivers")))
+func TestExtract(t *testing.T) {
+	queries := loadMarked(t)
+	get := func(marker, funcName string) pgguard.ExtractedQuery {
+		t.Helper()
+		for _, q := range queries[marker] {
+			if q.FuncName == funcName {
+				return q
+			}
+		}
+		t.Fatalf("@%s: no %s call extracted (got %+v)", marker, funcName, queries[marker])
+		return pgguard.ExtractedQuery{}
+	}
 
-	type expected struct {
-		method     string
-		hasContext bool
+	tests := []struct {
+		marker, funcName string
+		want             pgguard.ExtractedQuery
+	}{
+		{"escaped", "QueryContext", pgguard.ExtractedQuery{
+			SQL: "SELECT \"name\"\nFROM users", NormalizedSQL: "SELECT \"name\"\nFROM users", BuildMethod: pgguard.BuildConstant}},
+		{"backtick", "QueryContext", pgguard.ExtractedQuery{
+			SQL: `SELECT "id" FROM "users"`, NormalizedSQL: `SELECT "id" FROM "users"`, BuildMethod: pgguard.BuildConstant}},
+		{"constconcat", "QueryContext", pgguard.ExtractedQuery{
+			SQL: "SELECT id, name FROM users", NormalizedSQL: "SELECT id, name FROM users", BuildMethod: pgguard.BuildConstant}},
+		{"dynconcat", "QueryContext", pgguard.ExtractedQuery{
+			SQL: "SELECT id FROM users WHERE name = '{name}'", BuildMethod: pgguard.BuildConcat}},
+		{"constsprintf", "QueryContext", pgguard.ExtractedQuery{
+			SQL: "SELECT id, name FROM users LIMIT 10", NormalizedSQL: "SELECT id, name FROM users LIMIT 10", BuildMethod: pgguard.BuildConstant}},
+		{"dynsprintf", "QueryContext", pgguard.ExtractedQuery{
+			SQL: "SELECT id FROM users LIMIT %d", BuildMethod: pgguard.BuildSprintf}},
+		{"assigned", "QueryContext", pgguard.ExtractedQuery{
+			SQL: "SELECT id FROM users WHERE id = $1", NormalizedSQL: "SELECT id FROM users WHERE id = $1", BuildMethod: pgguard.BuildConstant}},
+		{"pgxnamed", "Query", pgguard.ExtractedQuery{
+			API: pgguard.APIPgx, SQL: "SELECT id FROM users WHERE name = @name OR alias = @name",
+			NormalizedSQL: "SELECT id FROM users WHERE name = $1 OR alias = $1", BuildMethod: pgguard.BuildConstant}},
+		{"gormwhere", "Where", pgguard.ExtractedQuery{
+			API: pgguard.APIGORM, Call: pgguard.CallBuild, Kind: pgguard.SQLFragment, Clause: "WHERE",
+			SQL:           "name = ? AND id IN ? AND note = '?'",
+			NormalizedSQL: "name = $1 AND id IN ($2) AND note = '?'", BuildMethod: pgguard.BuildConstant}},
+		{"gormwhere", "Find", pgguard.ExtractedQuery{API: pgguard.APIGORM}},
+		{"gormnamed", "Raw", pgguard.ExtractedQuery{
+			API: pgguard.APIGORM, Call: pgguard.CallBuild, SQL: "SELECT * FROM users WHERE name = @name",
+			NormalizedSQL: "SELECT * FROM users WHERE name = $1", BuildMethod: pgguard.BuildConstant}},
+		{"prepare", "Prepare", pgguard.ExtractedQuery{
+			Call: pgguard.CallPrepare, SQL: "SELECT 1", NormalizedSQL: "SELECT 1", BuildMethod: pgguard.BuildConstant}},
+		{"stmt", "Query", pgguard.ExtractedQuery{}},
+		{"rangebody", "QueryContext", pgguard.ExtractedQuery{
+			SQL: "SELECT $1::int", NormalizedSQL: "SELECT $1::int", BuildMethod: pgguard.BuildConstant}},
+		{"forinit", "QueryContext", pgguard.ExtractedQuery{
+			SQL: "SELECT 1", NormalizedSQL: "SELECT 1", BuildMethod: pgguard.BuildConstant}},
 	}
-	want := map[string]expected{
-		"SELECT 'db-query'":                        {"Query", false},
-		"SELECT 'db-exec'":                         {"Exec", false},
-		"SELECT 'db-query-row'":                    {"QueryRow", false},
-		"SELECT 'db-query-context'":                {"QueryContext", true},
-		"SELECT 'db-exec-context'":                 {"ExecContext", true},
-		"SELECT 'db-query-row-context'":            {"QueryRowContext", true},
-		"SELECT 'tx-query'":                        {"Query", false},
-		"SELECT 'tx-exec-context'":                 {"ExecContext", true},
-		"SELECT 'conn-query-context'":              {"QueryContext", true},
-		"SELECT 'pgx-query'":                       {"Query", true},
-		"SELECT 'pgx-exec'":                        {"Exec", true},
-		"SELECT 'pgx-query-row'":                   {"QueryRow", true},
-		"SELECT 'pgx-tx-query'":                    {"Query", true},
-		"SELECT 'embedded-query'":                  {"Query", false},
-		"SELECT 'method-expression-query'":         {"Query", false},
-		"SELECT 'method-expression-query-context'": {"QueryContext", true},
-	}
-	if len(queries) != len(want) {
-		t.Fatalf("got %d SQL calls, want %d: %+v", len(queries), len(want), queries)
-	}
-	seen := make(map[string]bool)
-	for _, query := range queries {
-		expectation, ok := want[query.SQL]
-		if !ok {
-			t.Errorf("unexpected SQL %q from %s; unrelated methods and Stmt values must be ignored", query.SQL, query.FuncName)
+	for _, tt := range tests {
+		if tt.marker == "gormwhere" || tt.marker == "gormnamed" || tt.marker == "constconcat" || tt.marker == "constsprintf" || tt.marker == "assigned" || tt.marker == "escaped" || tt.marker == "backtick" {
 			continue
 		}
-		if seen[query.SQL] {
-			t.Errorf("duplicate extraction of %q", query.SQL)
+		q := get(tt.marker, tt.funcName)
+		want := tt.want
+		if want.API == "" {
+			want.API = pgguard.APIDatabaseSQL
 		}
-		seen[query.SQL] = true
-		if query.FuncName != expectation.method || query.HasContext != expectation.hasContext || query.BuildMethod != "literal" {
-			t.Errorf("%q: got method=%s context=%v build=%s, want method=%s context=%v build=literal", query.SQL, query.FuncName, query.HasContext, query.BuildMethod, expectation.method, expectation.hasContext)
+		if want.Call == "" {
+			want.Call = pgguard.CallQuery
+		}
+		if want.Kind == "" && want.SQL != "" {
+			want.Kind = pgguard.SQLStatement
+		}
+		if q.API != want.API || q.Call != want.Call || q.Kind != want.Kind || q.Clause != want.Clause ||
+			q.SQL != want.SQL || q.NormalizedSQL != want.NormalizedSQL || q.BuildMethod != want.BuildMethod {
+			t.Errorf("@%s %s:\n got %+v\nwant %+v", tt.marker, tt.funcName, q, want)
 		}
 	}
-	for sql := range want {
-		if !seen[sql] {
-			t.Errorf("missing SQL call %q", sql)
+
+	contexts := map[string]bool{"escaped": true, "pgxnamed": true, "prepare": false, "stmt": false}
+	for marker, want := range contexts {
+		if q := queries[marker][0]; q.HasContext != want {
+			t.Errorf("@%s: HasContext = %v, want %v", marker, q.HasContext, want)
 		}
 	}
+
+	if q := get("rangebody", "QueryContext"); !q.InLoop {
+		t.Error("@rangebody: query in a range body should be InLoop")
+	}
+	if q := get("forinit", "QueryContext"); q.InLoop {
+		t.Error("@forinit: query in a for statement's init runs once and should not be InLoop")
+	}
+
 }

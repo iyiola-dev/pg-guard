@@ -1,9 +1,11 @@
 package analyzer
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"sort"
+	"go/token"
+	"slices"
 
 	pgguard "github.com/iyiola-dev/pg-guard"
 	"github.com/iyiola-dev/pg-guard/internal/checks"
@@ -12,21 +14,26 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
-const largeTableThreshold = 100_000
-
 func Run(ctx context.Context, cfg pgguard.Config) ([]pgguard.Finding, error) {
-	pkgs, err := loadPackages(cfg.Patterns)
+	pkgs, err := loadPackages(cfg.Patterns, false)
 	if err != nil {
 		return nil, fmt.Errorf("analyzer: load packages: %w", err)
 	}
 
-	queries := extractor.Extract(pkgs)
+	// With tests enabled a package's files also appear in its test variant,
+	// so keep one query per call site.
+	var queries []pgguard.ExtractedQuery
+	seen := make(map[token.Position]bool)
+	for _, pkg := range pkgs {
+		for _, q := range extractor.Extract(pkg.Fset, pkg.Syntax, pkg.TypesInfo) {
+			if !seen[q.Pos] {
+				seen[q.Pos] = true
+				queries = append(queries, q)
+			}
+		}
+	}
 
-	var findings []pgguard.Finding
-	findings = append(findings, checks.CheckUnparameterized(queries)...)
-	findings = append(findings, checks.CheckMissingContext(queries)...)
-	findings = append(findings, checks.CheckNPlusOne(queries)...)
-	findings = append(findings, checks.CheckInvalidSQL(queries)...)
+	findings := StaticChecks(queries)
 
 	if cfg.DSN != "" {
 		dbFindings, err := runDBChecks(ctx, cfg.DSN, queries)
@@ -36,19 +43,32 @@ func Run(ctx context.Context, cfg pgguard.Config) ([]pgguard.Finding, error) {
 		findings = append(findings, dbFindings...)
 	}
 
-	sort.Slice(findings, func(i, j int) bool {
-		if findings[i].Pos.Filename != findings[j].Pos.Filename {
-			return findings[i].Pos.Filename < findings[j].Pos.Filename
-		}
-		return findings[i].Pos.Line < findings[j].Pos.Line
+	slices.SortStableFunc(findings, func(a, b pgguard.Finding) int {
+		return cmp.Or(
+			cmp.Compare(a.Pos.Filename, b.Pos.Filename),
+			cmp.Compare(a.Pos.Line, b.Pos.Line),
+			cmp.Compare(a.Pos.Column, b.Pos.Column),
+			cmp.Compare(a.Check, b.Check),
+		)
 	})
 
 	return findings, nil
 }
 
-func loadPackages(patterns []string) ([]*packages.Package, error) {
+// StaticChecks runs the checks that need no database.
+func StaticChecks(queries []pgguard.ExtractedQuery) []pgguard.Finding {
+	var findings []pgguard.Finding
+	findings = append(findings, checks.CheckUnparameterized(queries)...)
+	findings = append(findings, checks.CheckMissingContext(queries)...)
+	findings = append(findings, checks.CheckNPlusOne(queries)...)
+	findings = append(findings, checks.CheckInvalidSQL(queries)...)
+	return findings
+}
+
+func loadPackages(patterns []string, tests bool) ([]*packages.Package, error) {
 	cfg := &packages.Config{
-		Mode: packages.NeedSyntax | packages.NeedFiles | packages.NeedName | packages.NeedTypes | packages.NeedTypesInfo,
+		Mode:  packages.NeedSyntax | packages.NeedFiles | packages.NeedName | packages.NeedTypes | packages.NeedTypesInfo,
+		Tests: tests,
 	}
 	pkgs, err := packages.Load(cfg, patterns...)
 	if err != nil {
@@ -65,6 +85,8 @@ func loadPackages(patterns []string) ([]*packages.Package, error) {
 	}
 	return pkgs, nil
 }
+
+const largeTableThreshold = 100_000
 
 func runDBChecks(ctx context.Context, dsn string, queries []pgguard.ExtractedQuery) ([]pgguard.Finding, error) {
 	db, err := dbinfo.New(ctx, dsn)
